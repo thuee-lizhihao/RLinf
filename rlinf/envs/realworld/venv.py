@@ -51,22 +51,22 @@ class NoAutoResetSyncVectorEnv(SyncVectorEnv):
             (
                 observation,
                 self._rewards[i],
-                self._terminateds[i],
-                self._truncateds[i],
+                self._terminations[i],
+                self._truncations[i],
                 info,
             ) = env.step(action)
 
             observations.append(observation)
             infos = self._add_info(infos, info, i)
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
+        self._observations = concatenate(
+            self.single_observation_space, observations, self._observations
         )
 
         return (
-            deepcopy(self.observations) if self.copy else self.observations,
+            deepcopy(self._observations) if self.copy else self._observations,
             np.copy(self._rewards),
-            np.copy(self._terminateds),
-            np.copy(self._truncateds),
+            np.copy(self._terminations),
+            np.copy(self._truncations),
             infos,
         )
 

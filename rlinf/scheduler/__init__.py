@@ -20,6 +20,7 @@ from .hardware import (
     AcceleratorUtil,
     FrankaHWInfo,
     HardwareInfo,
+    SO101HWInfo,
     Turtle2HWInfo,
 )
 from .manager import WorkerInfo
@@ -37,6 +38,7 @@ __all__ = [
     "AcceleratorType",
     "HardwareInfo",
     "FrankaHWInfo",
+    "SO101HWInfo",
     "Turtle2HWInfo",
     "CollectiveGroupOptions",
     "Cluster",

@@ -84,14 +84,24 @@ class NodeHardwareConfig:
                 error_suffix="in cluster node_group hardware yaml config",
             )
 
+        def _to_plain_config(c):
+            """Convert OmegaConf config to plain Python dict so yaml.dump can serialize it."""
+            try:
+                from omegaconf import OmegaConf
+                if OmegaConf.is_config(c):
+                    return OmegaConf.to_container(c, resolve=True)
+            except ImportError:
+                pass
+            return dict(c) if hasattr(c, "keys") else c
+
         # Ensure all configs are unique
         config_strs = [
-            yaml.dump(dict(config), sort_keys=True) for config in self.configs
+            yaml.dump(_to_plain_config(config), sort_keys=True) for config in self.configs
         ]
         assert len(config_strs) == len(set(config_strs)), (
             "Duplicate hardware configs found in node hardware config: \n"
             + "\n".join(
-                [yaml.dump(dict(config), sort_keys=False) for config in self.configs]
+                [yaml.dump(_to_plain_config(config), sort_keys=False) for config in self.configs]
             )
         )
 

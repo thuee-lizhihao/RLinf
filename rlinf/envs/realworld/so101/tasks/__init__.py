@@ -12,15 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .franka import FrankaConfig, FrankaHWInfo
-from .so101 import SO101Config, SO101HWInfo
-from .xsquare import Turtle2Config, Turtle2HWInfo
+from gymnasium.envs.registration import register
 
-__all__ = [
-    "FrankaConfig",
-    "FrankaHWInfo",
-    "SO101Config",
-    "SO101HWInfo",
-    "Turtle2Config",
-    "Turtle2HWInfo",
-]
+from rlinf.envs.realworld.so101.tasks.reach_env import SO101ReachEnv as SO101ReachEnv
+
+register(
+    id="SO101ReachEnv-v1",
+    entry_point="rlinf.envs.realworld.so101.tasks:SO101ReachEnv",
+)
+
