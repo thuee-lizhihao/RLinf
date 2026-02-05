@@ -202,6 +202,7 @@ class SO101Controller(Worker):
         self._state = SO101RobotState()
 
         self._bus = None
+        self._joint_limit_cache_deg: dict[str, tuple[float, float]] | None = None
         self._motor_names = [
             "shoulder_pan",
             "shoulder_lift",
@@ -378,6 +379,26 @@ class SO101Controller(Worker):
         self._bus.configure_motors()
         for m in motors:
             self._bus.write("Operating_Mode", m, OperatingMode.POSITION.value)
+
+        # Soft-start safety: avoid a "jump" when enabling torque.
+        # If motors still have a stale Goal_Position from a previous session, turning torque on can cause
+        # the arm to snap toward that target. To prevent this, we latch the current raw Present_Position
+        # into Goal_Position *before* enabling torque.
+        #
+        # Use raw units (normalize=False) to avoid relying on calibration at this stage.
+        try:
+            present_raw = self._bus.sync_read(
+                "Present_Position", motors=list(motors.keys()), normalize=False
+            )
+            self._bus.sync_write("Goal_Position", present_raw, normalize=False)
+            # Small settle time so the bus clears writes before torque enable.
+            time.sleep(0.05)
+        except Exception as e:
+            self._logger.warning(
+                f"SO101 soft-start latch (Present_Position→Goal_Position) failed: {e}. "
+                "Torque enable may cause a transient motion if stale goals exist."
+            )
+
         self._bus.enable_torque()
 
         # If calibration is required, we should never silently proceed without it.
@@ -401,6 +422,83 @@ class SO101Controller(Worker):
                     f"Failed to read calibration from motors on {self._port}: {e}. "
                     "Joint positions will be read without normalization."
                 )
+
+        # Cache joint limits in user units (degrees / 0-100) for safety checks on command.
+        self._joint_limit_cache_deg = None
+
+    def _enforce_joint_limits_enabled(self) -> bool:
+        # Default to enabled for safety. Can be disabled for debugging.
+        v = os.environ.get("SO101_ENFORCE_JOINT_LIMITS", "1").strip().lower()
+        return v in {"1", "true", "t", "yes", "y", "on"}
+
+    def _joint_limits_deg(self) -> dict[str, tuple[float, float]]:
+        """Compute per-motor joint limits in *user units* (degrees for arm, [0,100] for gripper).
+
+        For MotorNormMode.DEGREES, LeRobot uses the calibration [range_min, range_max] (raw) to define a
+        symmetric degree range around mid=(min+max)/2, via:
+          deg = (raw - mid) * 360 / (max_res)
+        so the reachable bounds in degrees are approximately:
+          [-((max-min)/2)*360/max_res, +((max-min)/2)*360/max_res]
+        """
+        assert self._bus is not None, "SO101 motor bus is not connected."
+        if self._joint_limit_cache_deg is not None:
+            return self._joint_limit_cache_deg
+
+        if not getattr(self._bus, "calibration", None):
+            raise RuntimeError(
+                "Joint limit enforcement requested but no calibration is available on the motor bus. "
+                "Provide a calibration JSON (SO101_CALIBRATION_PATH) or disable enforcement via "
+                "SO101_ENFORCE_JOINT_LIMITS=0."
+            )
+
+        limits: dict[str, tuple[float, float]] = {}
+        # Import types lazily; LeRobot isn't a hard dependency for dummy runs.
+        from lerobot.motors.motors_bus import MotorNormMode  # type: ignore
+
+        for name, motor in self._bus.motors.items():
+            cal = self._bus.calibration.get(name)
+            if cal is None:
+                continue
+            min_raw = float(cal.range_min)
+            max_raw = float(cal.range_max)
+            if motor.norm_mode is MotorNormMode.DEGREES:
+                # symmetric bounds around 0 degrees
+                max_res = float(self._bus.model_resolution_table[self._bus._id_to_model(motor.id)] - 1)  # type: ignore[attr-defined]
+                span_raw = max_raw - min_raw
+                max_abs_deg = (span_raw * 180.0) / max_res
+                limits[name] = (-max_abs_deg, +max_abs_deg)
+            elif motor.norm_mode is MotorNormMode.RANGE_0_100:
+                limits[name] = (0.0, 100.0)
+            elif motor.norm_mode is MotorNormMode.RANGE_M100_100:
+                limits[name] = (-100.0, 100.0)
+            else:
+                # Unknown norm mode; don't enforce.
+                continue
+
+        self._joint_limit_cache_deg = limits
+        return limits
+
+    def _assert_arm_goal_within_limits(self, goal_deg: dict[str, float]) -> None:
+        if not self._enforce_joint_limits_enabled():
+            return
+        limits = self._joint_limits_deg()
+        margin_deg = float(os.environ.get("SO101_JOINT_LIMIT_MARGIN_DEG", "0.0"))
+
+        offenders: list[str] = []
+        for name, target in goal_deg.items():
+            if name not in limits:
+                continue
+            lo, hi = limits[name]
+            lo2, hi2 = lo + margin_deg, hi - margin_deg
+            if not (lo2 <= float(target) <= hi2):
+                offenders.append(
+                    f"{name}: target={float(target):.3f}deg not in [{lo2:.3f}, {hi2:.3f}] (raw_limit=[{lo:.3f},{hi:.3f}], margin={margin_deg:.3f})"
+                )
+        if offenders:
+            raise RuntimeError(
+                "Safety stop: commanded joint target would exceed calibrated limits.\n"
+                + "\n".join(offenders)
+            )
 
     def disconnect(self, disable_torque: bool = True):
         if self._bus is None:
@@ -445,15 +543,27 @@ class SO101Controller(Worker):
         if gripper_pos is not None:
             goal["gripper"] = float(np.clip(gripper_pos, 0.0, 100.0))
 
+        # Safety: prevent commanding beyond calibrated joint limits (especially important for DEGREES mode,
+        # where unnormalization does not clamp by default).
+        self._assert_arm_goal_within_limits(goal)
+
         self._bus.sync_write("Goal_Position", goal)
 
     def open_gripper(self, pos: float = 100.0):
-        self.command_joints(self._state.arm_joint_position, gripper_pos=pos)
+        """Open gripper without disturbing arm joints."""
+        assert self._bus is not None, "SO101 motor bus is not connected."
+        pos = float(np.clip(pos, 0.0, 100.0))
+        self._bus.sync_write("Goal_Position", {"gripper": pos})
         self._state.gripper_open = True
+        self._state.gripper_position = pos
 
     def close_gripper(self, pos: float = 0.0):
-        self.command_joints(self._state.arm_joint_position, gripper_pos=pos)
+        """Close gripper without disturbing arm joints."""
+        assert self._bus is not None, "SO101 motor bus is not connected."
+        pos = float(np.clip(pos, 0.0, 100.0))
+        self._bus.sync_write("Goal_Position", {"gripper": pos})
         self._state.gripper_open = False
+        self._state.gripper_position = pos
 
     def get_state(self) -> SO101RobotState:
         """Return last cached state. Env is responsible for updating kinematics."""
