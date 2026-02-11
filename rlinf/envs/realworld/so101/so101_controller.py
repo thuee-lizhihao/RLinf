@@ -15,11 +15,9 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 from typing import Optional
 
 import numpy as np
@@ -29,134 +27,12 @@ from rlinf.utils.logging import get_logger
 
 from .so101_robot_state import SO101RobotState
 
-# region agent log
-def _dlog(
-    hypothesisId: str,
-    location: str,
-    message: str,
-    data: dict | None = None,
-    runId: str = "pre-fix",
-):
-    """Write NDJSON logs into <repo_root>/.cursor/debug.log for debug-mode evidence."""
-    import json
-    import time as _time
-
-    try:
-        # file: <repo_root>/RLinf/rlinf/envs/realworld/so101/so101_controller.py
-        repo_root = Path(__file__).resolve().parents[6]
-        log_path = repo_root / ".cursor" / "debug.log"
-        os.makedirs(str(log_path.parent), exist_ok=True)
-        payload = {
-            "sessionId": "debug-session",
-            "runId": runId,
-            "hypothesisId": hypothesisId,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(_time.time() * 1000),
-        }
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-# endregion
-
 
 def _env_flag(name: str, default: bool) -> bool:
     v = os.environ.get(name, "")
     if v == "":
         return default
     return v.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-
-
-def _unique_existing_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    out: list[Path] = []
-    for p in paths:
-        try:
-            rp = str(p.expanduser().resolve())
-        except Exception:
-            rp = str(p)
-        if rp in seen:
-            continue
-        seen.add(rp)
-        if Path(rp).is_file():
-            out.append(Path(rp))
-    return out
-
-
-def _discover_so101_calibration_files(
-    *,
-    robot_type: str,
-    robot_id: str | None,
-) -> list[Path]:
-    """Best-effort discovery of LeRobot calibration JSON files.
-
-    We intentionally keep the search bounded and deterministic (no full-disk scans).
-    """
-    home = Path.home()
-    bases: list[Path] = [
-        # LeRobot cache (common)
-        home / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / robot_type,
-        # Fallback variants seen in the wild
-        home / ".cache" / "huggingface" / "lerobot" / "calibrations" / "robots" / robot_type,
-        home / ".cache" / "lerobot" / "calibration" / "robots" / robot_type,
-        # Project-local (optional convention)
-        Path.cwd() / "calibration",
-        Path.cwd() / "calibrations",
-        Path.cwd(),
-    ]
-
-    candidates: list[Path] = []
-    if robot_id:
-        for b in bases:
-            candidates.append(b / f"{robot_id}.json")
-
-    for b in bases:
-        try:
-            if b.is_dir():
-                candidates.extend(sorted(b.glob("*.json")))
-        except Exception:
-            # Ignore permission / transient FS errors
-            pass
-
-    return _unique_existing_paths(candidates)
-
-
-def _default_lerobot_calibration_path(*, robot_type: str, robot_id: str) -> Path:
-    # Matches the common LeRobot cache convention.
-    return (
-        Path.home()
-        / ".cache"
-        / "huggingface"
-        / "lerobot"
-        / "calibration"
-        / "robots"
-        / robot_type
-        / f"{robot_id}.json"
-    )
-
-
-def _run_lerobot_calibrate(*, robot_type: str, port: str, robot_id: str) -> None:
-    """Run LeRobot calibration (requires `lerobot-calibrate` on PATH).
-
-    We intentionally avoid "source tree" fallbacks (e.g. python -m + PYTHONPATH hacks),
-    because they introduce ambiguity about which LeRobot version is being used.
-    """
-    if not shutil.which("lerobot-calibrate"):
-        raise FileNotFoundError(
-            "SO101 auto calibration requested, but `lerobot-calibrate` was not found on PATH.\n"
-            "Please install LeRobot so its console scripts are available, e.g.:\n"
-            "  pip install -e \"/path/to/lerobot[feetech]\"\n"
-            "Then rerun, or run `lerobot-calibrate` manually and set SO101_CALIBRATION_PATH."
-        )
-    cmd = [
-        "lerobot-calibrate",
-        f"--robot.type={robot_type}",
-        f"--robot.port={port}",
-        f"--robot.id={robot_id}",
-    ]
-    subprocess.run(cmd, check=True)
 
 
 @dataclass
@@ -215,52 +91,21 @@ class SO101Controller(Worker):
     def connect(self):
         """Connect to the motor bus, ensure calibration, and configure motors.
 
-        Calibration policy (default: calibration is REQUIRED):
-        - If `calibration_path` was provided at construction, it must exist and be loadable.
-        - Otherwise, we try to discover an existing calibration JSON from common LeRobot cache locations.
-        - If none exists and `SO101_AUTO_CALIBRATE=1`, we invoke `lerobot-calibrate` to generate one.
+        Calibration is required by default: you must pass a calibration JSON path at
+        construction (or set SO101_CALIBRATION_PATH and pass it when creating the
+        controller). If no path is provided, connect() raises with a message that
+        suggests possible paths and how to run the official calibration tool.
 
         Environment variables:
-        - `SO101_REQUIRE_CALIBRATION` (default: 1): enforce calibration JSON usage.
-        - `SO101_ID` (default: "so101"): used to name/discover LeRobot calibration file.
-        - `SO101_ROBOT_TYPE` (default: "so101_follower"): used to form LeRobot cache path.
-        - `SO101_CALIBRATION_AUTO_SELECT` (optional): when multiple calibration files are found,
-          set to "first" or an integer index (0-based) to auto-pick one; otherwise we raise.
-        - `SO101_AUTO_CALIBRATE` (default: 0): if set, run `lerobot-calibrate ...` when missing.
+        - `SO101_REQUIRE_CALIBRATION` (default: 1): if 0, allow running without calibration.
         """
         if self._bus is not None:
             return
-
-        # region agent log
-        import sys as _sys
-        import importlib.util as _iu
-
-        _dlog(
-            "H1",
-            "so101_controller.py:SO101Controller.connect:pre_import",
-            "About to import lerobot.* in worker",
-            {
-                "python": _sys.executable,
-                "cwd": os.getcwd(),
-                "sys_path0": _sys.path[0] if len(_sys.path) > 0 else None,
-                "lerobot_spec": str(_iu.find_spec("lerobot")),
-                "lerobot_calibrate_in_PATH": bool(shutil.which("lerobot-calibrate")),
-            },
-        )
-        # endregion
 
         try:
             from lerobot.motors import Motor, MotorNormMode
             from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
         except ModuleNotFoundError as e:
-            # region agent log
-            _dlog(
-                "H2",
-                "so101_controller.py:SO101Controller.connect:import_failed",
-                "Failed importing lerobot.*",
-                {"error": repr(e)},
-            )
-            # endregion
             raise ModuleNotFoundError(
                 "SO101Controller requires LeRobot Feetech support. "
                 "Install LeRobot with feetech extras (and scservo_sdk), or add LeRobot to PYTHONPATH. "
@@ -268,85 +113,22 @@ class SO101Controller(Worker):
             ) from e
 
         require_calibration = _env_flag("SO101_REQUIRE_CALIBRATION", True)
-        robot_type = os.environ.get("SO101_ROBOT_TYPE", "so101_follower")
-        robot_id = os.environ.get("SO101_ID", "so101")
-
         if require_calibration and not self._calibration_path:
-            found = _discover_so101_calibration_files(robot_type=robot_type, robot_id=robot_id)
-            if len(found) == 1:
-                self._calibration_path = str(found[0])
-                self._logger.info(f"Using discovered SO101 calibration: {self._calibration_path}")
-            elif len(found) > 1:
-                auto_select = os.environ.get("SO101_CALIBRATION_AUTO_SELECT", "")
-                picked: Path | None = None
-                if auto_select.strip().lower() == "first":
-                    picked = sorted(found)[0]
-                else:
-                    try:
-                        idx = int(auto_select)
-                        if 0 <= idx < len(found):
-                            picked = found[idx]
-                    except Exception:
-                        picked = None
-                if picked is not None:
-                    self._calibration_path = str(picked)
-                    self._logger.warning(
-                        "Multiple SO101 calibration files found; "
-                        f"auto-selected {self._calibration_path} via SO101_CALIBRATION_AUTO_SELECT={auto_select!r}."
-                    )
-                else:
-                    msg = "\n".join([f"- {p}" for p in found])
-                    raise RuntimeError(
-                        "SO101 calibration is required but multiple calibration files were discovered.\n"
-                        "Please set SO101_CALIBRATION_PATH explicitly, or set SO101_CALIBRATION_AUTO_SELECT "
-                        "to 'first' or an integer index (0-based).\n"
-                        f"Discovered files:\n{msg}"
-                    )
-            else:
-                if _env_flag("SO101_AUTO_CALIBRATE", False):
-                    # Try to generate a calibration file via LeRobot CLI.
-                    # This is interactive; ensure you run this with a TTY.
-                    expected = _default_lerobot_calibration_path(
-                        robot_type=robot_type, robot_id=robot_id
-                    )
-                    expected.parent.mkdir(parents=True, exist_ok=True)
-                    cmd = [
-                        "lerobot-calibrate",
-                        f"--robot.type={robot_type}",
-                        f"--robot.port={self._port}",
-                        f"--robot.id={robot_id}",
-                    ]
-                    self._logger.warning(
-                        "SO101 calibration file not found; running LeRobot calibration:\n"
-                        f"Expected output file: {expected}"
-                    )
-                    _run_lerobot_calibrate(robot_type=robot_type, port=self._port, robot_id=robot_id)
-                    if expected.is_file():
-                        self._calibration_path = str(expected)
-                    else:
-                        # Re-scan in case LeRobot wrote elsewhere.
-                        found2 = _discover_so101_calibration_files(
-                            robot_type=robot_type, robot_id=robot_id
-                        )
-                        if len(found2) >= 1:
-                            self._calibration_path = str(sorted(found2)[0])
-                        else:
-                            raise RuntimeError(
-                                "LeRobot calibration finished but no calibration JSON was found.\n"
-                                f"Tried expected path: {expected}\n"
-                                "Please locate the generated file and set SO101_CALIBRATION_PATH."
-                            )
-                else:
-                    expected = _default_lerobot_calibration_path(
-                        robot_type=robot_type, robot_id=robot_id
-                    )
-                    raise RuntimeError(
-                        "SO101 calibration is required but no calibration file was provided or discovered.\n"
-                        "Set SO101_CALIBRATION_PATH to an existing calibration JSON, or run:\n"
-                        f"  lerobot-calibrate --robot.type={robot_type} --robot.port={self._port} --robot.id={robot_id}\n"
-                        f"Common expected location: {expected}\n"
-                        "If you have multiple robots, make sure SO101_ID matches the one you calibrated."
-                    )
+            robot_type = os.environ.get("SO101_ROBOT_TYPE", "so101_follower")
+            robot_id = os.environ.get("SO101_ID", "my_awesome_follower_arm")
+            home = Path.home()
+            common = home / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / robot_type / f"{robot_id}.json"
+            raise RuntimeError(
+                "SO101 calibration path is required but was not provided.\n"
+                "Pass calibration_path when creating the controller, or set SO101_CALIBRATION_PATH and pass it to the constructor.\n\n"
+                "Possible locations to check:\n"
+                f"  - {common}\n"
+                "  - ./calibration/\n"
+                "  - ./calibrations/\n\n"
+                "To generate a calibration file, run the official LeRobot calibration tool (with the robot connected):\n"
+                f"  lerobot-calibrate --robot.type={robot_type} --robot.port={self._port} --robot.id={robot_id}\n\n"
+                "Then set SO101_CALIBRATION_PATH to the output JSON path, or pass it as calibration_path."
+            )
 
         motors = {
             "shoulder_pan": Motor(1, "sts3215", MotorNormMode.DEGREES),
