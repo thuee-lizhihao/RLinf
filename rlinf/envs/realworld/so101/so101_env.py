@@ -58,8 +58,35 @@ class SO101RobotConfig:
     joint_reset_qpos: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
     )
-    ee_pose_limit_min: np.ndarray = field(default_factory=lambda: np.array([-1, -1, -1, -3.14, -3.14, -3.14]))
-    ee_pose_limit_max: np.ndarray = field(default_factory=lambda: np.array([1, 1, 1, 3.14, 3.14, 3.14]))
+    ee_pose_limit_min: np.ndarray = field(
+        default_factory=lambda: np.array(
+            [
+                -0.33838826543491113,
+                -0.43320932355460706,
+                -0.221904771238294,
+                -3.1414882589123065,
+                -1.5616055459910023,
+                -3.1410440964660715,
+            ]
+        )
+    )
+    ee_pose_limit_max: np.ndarray = field(
+        default_factory=lambda: np.array(
+            [
+                0.47648009544149583,
+                0.43426311165235965,
+                0.5260975248250594,
+                3.1415720814029955,
+                1.538700826334587,
+                3.14075636588622,
+            ]
+        )
+    )
+    min_state_dt: float = 1e-3
+    vel_smoothing_alpha: float = 0.0
+    tcp_linear_vel_max: float = 1.0
+    tcp_angular_vel_max: float = 10.0
+    tcp_pose_jump_warn_threshold: float = 0.05
     max_num_steps: int = 100
 
 
@@ -92,8 +119,6 @@ class SO101Env(gym.Env):
 
         self._state = SO101RobotState()
         self._num_steps = 0
-        self._last_tcp_pose = None
-        self._last_step_time = None
 
         self._kin = None
         self._controller = None
@@ -150,6 +175,8 @@ class SO101Env(gym.Env):
             node_rank=self.node_rank,
             worker_rank=self.env_worker_rank,
             calibration_path=self.config.calibration_path,
+            urdf_path=self.config.urdf_path,
+            target_frame_name=self.config.target_frame_name,
         )
         self._controller.connect().wait()
 
@@ -239,66 +266,16 @@ class SO101Env(gym.Env):
         pose[3:] = R.from_euler("xyz", euler).as_quat()
         return pose
 
-    def _update_state(self, joints: dict[str, float], dt: float):
-        assert self._kin is not None
-        q = np.array(
-            [
-                joints["shoulder_pan"],
-                joints["shoulder_lift"],
-                joints["elbow_flex"],
-                joints["wrist_flex"],
-                joints["wrist_roll"],
-            ],
-            dtype=float,
-        )
-        T = self._kin.forward_kinematics(q)
-        pos = T[:3, 3]
-        quat = R.from_matrix(T[:3, :3].copy()).as_quat()
-        tcp_pose = np.concatenate([pos, quat], axis=0).astype(np.float32)
-
-        if self._last_tcp_pose is None or dt <= 0:
-            tcp_vel = np.zeros(6, dtype=np.float32)
-        else:
-            dp = (tcp_pose[:3] - self._last_tcp_pose[:3]) / dt
-            # approximate angular velocity by delta-rotvec / dt
-            r_prev = R.from_quat(self._last_tcp_pose[3:])
-            r_curr = R.from_quat(tcp_pose[3:])
-            drot = (r_curr * r_prev.inv()).as_rotvec() / dt
-            tcp_vel = np.concatenate([dp, drot], axis=0).astype(np.float32)
-
-        self._last_tcp_pose = tcp_pose.copy()
-        arm_joint_pos = q.astype(np.float32)
-        arm_joint_vel = np.zeros_like(arm_joint_pos)
-        gripper_pos = float(joints["gripper"])
-
-        self._state.arm_joint_position = arm_joint_pos
-        self._state.arm_joint_velocity = arm_joint_vel
-        self._state.gripper_position = gripper_pos
-        self._state.tcp_pose = tcp_pose
-        self._state.tcp_vel = tcp_vel
-
-        if self._controller is not None:
-            self._controller.update_state_from_joints(
-                arm_joint_pos_deg=arm_joint_pos,
-                arm_joint_vel_deg=arm_joint_vel,
-                gripper_pos=gripper_pos,
-                tcp_pose=tcp_pose,
-                tcp_vel=tcp_vel,
-            ).wait()
+    def _refresh_state_from_controller(self) -> SO101RobotState:
+        assert self._controller is not None
+        self._state = self._controller.sync_state().wait()[0]
+        return self._state
 
     def _get_observation(self):
         if self.config.is_dummy:
             return self._base_observation_space.sample()
 
-        assert self._controller is not None
-        joints = self._controller.get_joint_positions().wait()[0]
-        now = time.time()
-        if self._last_step_time is None:
-            dt = 0.0
-        else:
-            dt = now - self._last_step_time
-        self._last_step_time = now
-        self._update_state(joints, dt)
+        self._refresh_state_from_controller()
 
         frames = self._get_camera_frames()
         state = {
@@ -311,8 +288,6 @@ class SO101Env(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._num_steps = 0
-        self._last_tcp_pose = None
-        self._last_step_time = None
         obs = self._get_observation()
         return obs, {}
 
@@ -328,12 +303,8 @@ class SO101Env(gym.Env):
         assert self._controller is not None
         assert self._kin is not None
 
-        # Update current observation/state (joint read + FK)
-        joints = self._controller.get_joint_positions().wait()[0]
-        now = time.time()
-        dt = 0.0 if self._last_step_time is None else (now - self._last_step_time)
-        self._last_step_time = now
-        self._update_state(joints, dt if dt > 0 else 1e-3)
+        # Update current state from controller
+        self._refresh_state_from_controller()
 
         # Build desired tcp pose by applying deltas
         xyz_delta = action[:3] * float(self.config.action_scale[0])
@@ -373,8 +344,15 @@ class SO101Env(gym.Env):
             self._controller.open_gripper().wait()
             is_gripper_effective = True
 
-        # Send joint targets
-        self._controller.command_joints(q_target, gripper_pos=None).wait()
+        # Send joint targets using blocking wrapper.
+        self._controller.move_joints_blocking(
+            q_target,
+            gripper_pos=None,
+            timeout_s=max(0.5, 1.0 / float(self.config.step_frequency)),
+            joint_tolerance_deg=3.0,
+            max_step_delta_deg=5.0,
+            raise_on_fail=False,
+        ).wait()
 
         self._num_steps += 1
         # rate limit

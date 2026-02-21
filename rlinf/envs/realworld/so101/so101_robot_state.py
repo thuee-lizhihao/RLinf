@@ -40,6 +40,12 @@ class SO101RobotState:
     # Gripper motor is typically normalized to [0, 100] in LeRobot.
     gripper_position: float = 0.0
     gripper_open: bool = True
+    timestamp_s: float = 0.0
+    is_robot_up: bool = False
+    last_joint_max_error_deg: float = 0.0
+    last_joint_mean_error_deg: float = 0.0
+    last_ee_pos_error_m: float = 0.0
+    last_ee_rot_error_deg: float = 0.0
 
     def to_dict(self):
         return asdict(self)

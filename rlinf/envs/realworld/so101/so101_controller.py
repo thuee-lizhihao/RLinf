@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from rlinf.scheduler import Cluster, NodePlacementStrategy, Worker
 from rlinf.utils.logging import get_logger
@@ -45,6 +46,37 @@ class SO101JointCommand:
     gripper_pos: float
 
 
+@dataclass
+class SO101ControllerRuntimeConfig:
+    """Runtime parameters for SO101 high-level motion APIs."""
+
+    poll_period_s: float = 0.05
+    default_timeout_s: float = 3.0
+    default_joint_tolerance_deg: float = 2.0
+    default_max_step_delta_deg: float = 5.0
+    settle_time_s: float = 0.05
+    min_state_dt: float = 1e-3
+    vel_smoothing_alpha: float = 0.2
+    tcp_linear_vel_max: float = 1.0
+    tcp_angular_vel_max: float = 10.0
+
+
+@dataclass
+class SO101MoveResult:
+    """Result of a blocking joint-space motion."""
+
+    success: bool
+    timed_out: bool
+    duration_s: float
+    num_polls: int
+    max_joint_error_deg: float
+    mean_joint_error_deg: float
+    ee_pos_error_m: float
+    ee_rot_error_deg: float
+    target_joint_deg: np.ndarray
+    readback_joint_deg: np.ndarray
+
+
 class SO101Controller(Worker):
     """SO101 robot arm controller (serial Feetech).
 
@@ -61,24 +93,42 @@ class SO101Controller(Worker):
         node_rank: int = 0,
         worker_rank: int = 0,
         calibration_path: Optional[str] = None,
+        urdf_path: Optional[str] = None,
+        target_frame_name: str = "gripper_frame_link",
     ):
         cluster = Cluster()
         placement = NodePlacementStrategy(node_ranks=[node_rank])
-        return SO101Controller.create_group(port, calibration_path).launch(
+        return SO101Controller.create_group(
+            port, calibration_path, urdf_path, target_frame_name
+        ).launch(
             cluster=cluster,
             placement_strategy=placement,
             name=f"SO101Controller-{worker_rank}-{env_idx}",
         )
 
-    def __init__(self, port: str, calibration_path: Optional[str] = None):
+    def __init__(
+        self,
+        port: str,
+        calibration_path: Optional[str] = None,
+        urdf_path: Optional[str] = None,
+        target_frame_name: str = "gripper_frame_link",
+    ):
         super().__init__()
         self._logger = get_logger()
         self._port = port
         self._calibration_path = calibration_path
         self._state = SO101RobotState()
+        self._runtime_cfg = SO101ControllerRuntimeConfig()
 
         self._bus = None
         self._joint_limit_cache_deg: dict[str, tuple[float, float]] | None = None
+        self._kin = None
+        self._urdf_path = urdf_path
+        self._target_frame_name = target_frame_name
+        self._last_state_timestamp = None
+        self._last_joint_pos_deg = None
+        self._last_tcp_pose = None
+        self._last_tcp_vel = None
         self._motor_names = [
             "shoulder_pan",
             "shoulder_lift",
@@ -87,6 +137,10 @@ class SO101Controller(Worker):
             "wrist_roll",
             "gripper",
         ]
+
+    @staticmethod
+    def _default_urdf_path() -> str:
+        return str(Path(__file__).with_suffix("").parent / "assets" / "so101_minimal.urdf")
 
     def connect(self):
         """Connect to the motor bus, ensure calibration, and configure motors.
@@ -207,6 +261,31 @@ class SO101Controller(Worker):
 
         # Cache joint limits in user units (degrees / 0-100) for safety checks on command.
         self._joint_limit_cache_deg = None
+        self._init_kinematics()
+
+    def _init_kinematics(self) -> None:
+        if self._kin is not None:
+            return
+        urdf_path = self._urdf_path or self._default_urdf_path()
+        try:
+            from .kinematics import SO101Kinematics
+
+            self._kin = SO101Kinematics(
+                urdf_path=urdf_path,
+                target_frame_name=self._target_frame_name,
+                joint_names=[
+                    "shoulder_pan",
+                    "shoulder_lift",
+                    "elbow_flex",
+                    "wrist_flex",
+                    "wrist_roll",
+                ],
+            )
+        except ModuleNotFoundError as e:
+            self._logger.warning(
+                f"SO101 kinematics is unavailable, TCP metrics disabled. Error: {e}"
+            )
+            self._kin = None
 
     def _enforce_joint_limits_enabled(self) -> bool:
         # Default to enabled for safety. Can be disabled for debugging.
@@ -282,6 +361,18 @@ class SO101Controller(Worker):
                 + "\n".join(offenders)
             )
 
+    def get_joint_limits_deg(self) -> dict[str, tuple[float, float]]:
+        """Expose calibrated joint limits (user units) for external tooling."""
+        return self._joint_limits_deg()
+
+    def set_torque_enabled(self, enabled: bool) -> None:
+        """Enable/disable motor torque without disconnecting the bus."""
+        assert self._bus is not None, "SO101 motor bus is not connected."
+        if enabled:
+            self._bus.enable_torque()
+        else:
+            self._bus.disable_torque()
+
     def disconnect(self, disable_torque: bool = True):
         if self._bus is None:
             return
@@ -304,6 +395,96 @@ class SO101Controller(Worker):
         normalize = bool(self._bus.calibration)
         pos = self._bus.sync_read("Present_Position", normalize=normalize)
         return {k: float(pos[k]) for k in self._motor_names}
+
+    @staticmethod
+    def _joints_dict_to_q5(joints: dict[str, float]) -> np.ndarray:
+        return np.array(
+            [
+                joints["shoulder_pan"],
+                joints["shoulder_lift"],
+                joints["elbow_flex"],
+                joints["wrist_flex"],
+                joints["wrist_roll"],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _rot_error_deg_from_poses(q1: np.ndarray, q2: np.ndarray) -> float:
+        return float(np.linalg.norm((R.from_quat(q2) * R.from_quat(q1).inv()).as_rotvec()) * 180.0 / np.pi)
+
+    def _fk_pose(self, joint_pos_deg: np.ndarray) -> np.ndarray | None:
+        if self._kin is None:
+            return None
+        T = self._kin.forward_kinematics(np.asarray(joint_pos_deg, dtype=float).reshape(5))
+        pos = T[:3, 3]
+        quat = R.from_matrix(T[:3, :3].copy()).as_quat()
+        if self._last_tcp_pose is not None and np.dot(quat, self._last_tcp_pose[3:]) < 0:
+            quat = -quat
+        return np.concatenate([pos, quat], axis=0).astype(np.float32)
+
+    def sync_state(self) -> SO101RobotState:
+        """Refresh and return the latest structured robot state."""
+        joints = self.get_joint_positions()
+        now_ts = time.time()
+        q_deg = self._joints_dict_to_q5(joints)
+        gripper_pos = float(joints["gripper"])
+        tcp_pose = self._fk_pose(q_deg)
+
+        if self._last_state_timestamp is None:
+            dt = self._runtime_cfg.min_state_dt
+            arm_joint_vel = np.zeros(5, dtype=np.float32)
+            tcp_vel = np.zeros(6, dtype=np.float32)
+        else:
+            dt = max(now_ts - self._last_state_timestamp, self._runtime_cfg.min_state_dt)
+            if self._last_joint_pos_deg is not None:
+                arm_joint_vel = ((q_deg - self._last_joint_pos_deg) / dt).astype(np.float32)
+            else:
+                arm_joint_vel = np.zeros(5, dtype=np.float32)
+
+            if tcp_pose is None or self._last_tcp_pose is None:
+                tcp_vel = np.zeros(6, dtype=np.float32)
+            else:
+                dp = (tcp_pose[:3] - self._last_tcp_pose[:3]) / dt
+                drot = (
+                    (R.from_quat(tcp_pose[3:]) * R.from_quat(self._last_tcp_pose[3:]).inv()).as_rotvec() / dt
+                )
+                raw_tcp_vel = np.concatenate([dp, drot], axis=0).astype(np.float32)
+
+                linear_norm = np.linalg.norm(raw_tcp_vel[:3])
+                if linear_norm > self._runtime_cfg.tcp_linear_vel_max and linear_norm > 0:
+                    raw_tcp_vel[:3] = raw_tcp_vel[:3] * (
+                        self._runtime_cfg.tcp_linear_vel_max / linear_norm
+                    )
+
+                angular_norm = np.linalg.norm(raw_tcp_vel[3:])
+                if angular_norm > self._runtime_cfg.tcp_angular_vel_max and angular_norm > 0:
+                    raw_tcp_vel[3:] = raw_tcp_vel[3:] * (
+                        self._runtime_cfg.tcp_angular_vel_max / angular_norm
+                    )
+
+                alpha = float(np.clip(self._runtime_cfg.vel_smoothing_alpha, 0.0, 1.0))
+                if alpha > 0.0 and self._last_tcp_vel is not None:
+                    tcp_vel = (alpha * raw_tcp_vel + (1.0 - alpha) * self._last_tcp_vel).astype(np.float32)
+                else:
+                    tcp_vel = raw_tcp_vel
+
+        self._state.arm_joint_position = q_deg.astype(np.float32)
+        self._state.arm_joint_velocity = arm_joint_vel
+        self._state.gripper_position = gripper_pos
+        self._state.gripper_open = gripper_pos >= 50.0
+        if tcp_pose is not None:
+            self._state.tcp_pose = tcp_pose
+            self._state.tcp_vel = tcp_vel
+        self._state.timestamp_s = float(now_ts)
+        self._state.is_robot_up = bool(self.is_robot_up())
+
+        self._last_state_timestamp = now_ts
+        self._last_joint_pos_deg = q_deg.copy()
+        if tcp_pose is not None:
+            self._last_tcp_pose = tcp_pose.copy()
+            self._last_tcp_vel = tcp_vel.copy()
+        return self._state
 
     def command_joints(
         self,
@@ -331,6 +512,157 @@ class SO101Controller(Worker):
 
         self._bus.sync_write("Goal_Position", goal)
 
+    def move_joints_blocking(
+        self,
+        arm_joint_pos_deg: np.ndarray,
+        gripper_pos: Optional[float] = None,
+        timeout_s: Optional[float] = None,
+        joint_tolerance_deg: Optional[float] = None,
+        max_step_delta_deg: Optional[float] = None,
+        raise_on_fail: bool = True,
+    ) -> SO101MoveResult:
+        """Command joints and block until tolerance or timeout."""
+        q_target = np.asarray(arm_joint_pos_deg, dtype=float).reshape(5)
+        timeout = float(timeout_s if timeout_s is not None else self._runtime_cfg.default_timeout_s)
+        tolerance = float(
+            joint_tolerance_deg
+            if joint_tolerance_deg is not None
+            else self._runtime_cfg.default_joint_tolerance_deg
+        )
+        max_step = float(
+            max_step_delta_deg
+            if max_step_delta_deg is not None
+            else self._runtime_cfg.default_max_step_delta_deg
+        )
+
+        state0 = self.sync_state()
+        q0 = state0.arm_joint_position.astype(float)
+        if float(np.max(np.abs(q_target - q0))) > max_step + 1e-9:
+            raise RuntimeError(
+                f"Safety stop: max step delta {float(np.max(np.abs(q_target - q0))):.4f} exceeds {max_step:.4f} deg."
+            )
+        if not state0.is_robot_up:
+            raise RuntimeError("Robot is not up / controller bus disconnected.")
+
+        self.command_joints(q_target, gripper_pos=gripper_pos)
+        if self._runtime_cfg.settle_time_s > 0:
+            time.sleep(self._runtime_cfg.settle_time_s)
+
+        start = time.time()
+        num_polls = 0
+        last_err = np.abs(q0 - q_target)
+        last_q = q0.copy()
+        success = False
+        timed_out = False
+        while True:
+            s = self.sync_state()
+            num_polls += 1
+            q_rb = s.arm_joint_position.astype(float)
+            last_q = q_rb.copy()
+            last_err = np.abs(q_rb - q_target)
+            if float(np.max(last_err)) <= tolerance + 1e-9:
+                success = True
+                break
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                timed_out = True
+                break
+            time.sleep(self._runtime_cfg.poll_period_s)
+
+        duration = float(time.time() - start)
+        ee_pos_error_m = 0.0
+        ee_rot_error_deg = 0.0
+        if self._kin is not None:
+            T_t = self._kin.forward_kinematics(q_target)
+            T_r = self._kin.forward_kinematics(last_q)
+            ee_pos_error_m = float(np.linalg.norm(T_t[:3, 3] - T_r[:3, 3]))
+            ee_rot_error_deg = float(
+                np.linalg.norm(
+                    (
+                        R.from_matrix(T_r[:3, :3].copy())
+                        * R.from_matrix(T_t[:3, :3].copy()).inv()
+                    ).as_rotvec()
+                )
+                * 180.0
+                / np.pi
+            )
+
+        result = SO101MoveResult(
+            success=success,
+            timed_out=timed_out,
+            duration_s=duration,
+            num_polls=num_polls,
+            max_joint_error_deg=float(np.max(last_err)),
+            mean_joint_error_deg=float(np.mean(last_err)),
+            ee_pos_error_m=ee_pos_error_m,
+            ee_rot_error_deg=ee_rot_error_deg,
+            target_joint_deg=q_target.astype(np.float32),
+            readback_joint_deg=last_q.astype(np.float32),
+        )
+        self._state.last_joint_max_error_deg = result.max_joint_error_deg
+        self._state.last_joint_mean_error_deg = result.mean_joint_error_deg
+        self._state.last_ee_pos_error_m = result.ee_pos_error_m
+        self._state.last_ee_rot_error_deg = result.ee_rot_error_deg
+
+        if raise_on_fail and not result.success:
+            raise RuntimeError(
+                f"Blocking motion failed (timeout={result.timed_out}) with max joint error {result.max_joint_error_deg:.4f} deg."
+            )
+        return result
+
+    def run_joint_sequence_blocking(
+        self,
+        arm_joint_targets_deg: list[np.ndarray],
+        gripper_targets: Optional[list[Optional[float]]] = None,
+        timeout_s: Optional[float] = None,
+        joint_tolerance_deg: Optional[float] = None,
+        max_step_delta_deg: Optional[float] = None,
+    ) -> list[SO101MoveResult]:
+        """Execute a joint sequence with per-step blocking checks."""
+        results: list[SO101MoveResult] = []
+        if gripper_targets is None:
+            gripper_targets = [None] * len(arm_joint_targets_deg)
+        if len(gripper_targets) != len(arm_joint_targets_deg):
+            raise ValueError("gripper_targets length must match arm_joint_targets_deg length.")
+
+        for q_target, g_target in zip(arm_joint_targets_deg, gripper_targets):
+            r = self.move_joints_blocking(
+                q_target,
+                gripper_pos=g_target,
+                timeout_s=timeout_s,
+                joint_tolerance_deg=joint_tolerance_deg,
+                max_step_delta_deg=max_step_delta_deg,
+                raise_on_fail=True,
+            )
+            results.append(r)
+        return results
+
+    def recover_and_home(
+        self,
+        home_joint_pos_deg: np.ndarray,
+        home_gripper_pos: Optional[float] = None,
+        retries: int = 1,
+        timeout_s: Optional[float] = None,
+        joint_tolerance_deg: Optional[float] = None,
+        max_step_delta_deg: Optional[float] = None,
+    ) -> SO101MoveResult:
+        """Best-effort return to home with bounded retries."""
+        last_error = None
+        for _ in range(max(1, retries + 1)):
+            try:
+                return self.move_joints_blocking(
+                    home_joint_pos_deg,
+                    gripper_pos=home_gripper_pos,
+                    timeout_s=timeout_s,
+                    joint_tolerance_deg=joint_tolerance_deg,
+                    max_step_delta_deg=max_step_delta_deg,
+                    raise_on_fail=True,
+                )
+            except Exception as e:
+                last_error = e
+                time.sleep(self._runtime_cfg.poll_period_s)
+        raise RuntimeError(f"Failed to recover and return home: {last_error}")
+
     def open_gripper(self, pos: float = 100.0):
         """Open gripper without disturbing arm joints."""
         assert self._bus is not None, "SO101 motor bus is not connected."
@@ -347,8 +679,10 @@ class SO101Controller(Worker):
         self._state.gripper_open = False
         self._state.gripper_position = pos
 
-    def get_state(self) -> SO101RobotState:
-        """Return last cached state. Env is responsible for updating kinematics."""
+    def get_state(self, refresh: bool = False) -> SO101RobotState:
+        """Return structured robot state, optionally refreshed from hardware."""
+        if refresh:
+            return self.sync_state()
         return self._state
 
     def update_state_from_joints(
@@ -364,6 +698,8 @@ class SO101Controller(Worker):
         self._state.gripper_position = float(gripper_pos)
         self._state.tcp_pose = np.asarray(tcp_pose, dtype=np.float32)
         self._state.tcp_vel = np.asarray(tcp_vel, dtype=np.float32)
+        self._state.timestamp_s = float(time.time())
+        self._state.is_robot_up = bool(self.is_robot_up())
 
     def wait(self, seconds: float):
         time.sleep(seconds)
