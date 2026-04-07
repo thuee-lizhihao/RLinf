@@ -53,7 +53,7 @@ class SO101ControllerRuntimeConfig:
     poll_period_s: float = 0.05
     default_timeout_s: float = 3.0
     default_joint_tolerance_deg: float = 2.0
-    default_max_step_delta_deg: float = 5.0
+    default_max_step_delta_deg: float = 8.0
     settle_time_s: float = 0.05
     min_state_dt: float = 1e-3
     vel_smoothing_alpha: float = 0.2

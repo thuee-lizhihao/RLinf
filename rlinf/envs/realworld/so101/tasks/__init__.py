@@ -14,10 +14,24 @@
 
 from gymnasium.envs.registration import register
 
+from rlinf.envs.realworld.so101.tasks.ik_reach_check_env import (
+    SO101IKReachCheckEnv as SO101IKReachCheckEnv,
+)
 from rlinf.envs.realworld.so101.tasks.reach_env import SO101ReachEnv as SO101ReachEnv
 
 register(
     id="SO101ReachEnv-v1",
     entry_point="rlinf.envs.realworld.so101.tasks:SO101ReachEnv",
+)
+
+register(
+    id="SO101ReachDummyEnv-v1",
+    entry_point="rlinf.envs.realworld.so101.tasks:SO101ReachEnv",
+    kwargs={"default_dummy": True},
+)
+
+register(
+    id="SO101IKReachCheckEnv-v1",
+    entry_point="rlinf.envs.realworld.so101.tasks:SO101IKReachCheckEnv",
 )
 

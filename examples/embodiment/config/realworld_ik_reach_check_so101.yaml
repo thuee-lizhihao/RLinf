@@ -1,6 +1,5 @@
-# Phase2 观测链路 smoke 专用配置（SO101 真机，低风险动作）
 defaults:
-  - env/realworld_so101_reach@env.eval
+  - env/realworld_so101_ik_reach_check@env.eval
   - override hydra/job_logging: stdout
 
 hydra:
@@ -29,24 +28,23 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: .  # smoke 输出目录，video_cfg.video_base_dir 依赖此项
+    log_path: null
     project_name: rlinf
-    experiment_name: "smoke-obs-so101"
-    logger_backends: []
-
-# Smoke 步数（低风险动作序列长度）
-smoke_num_steps: 200
+    experiment_name: "so101-ik-reach-check"
+    logger_backends: ["tensorboard"] # wandb, swanlab
+  num_data_episodes: 5
+  record_task_description: False
 
 env:
   group_name: "EnvGroup"
   eval:
-    ignore_terminations: True
-    auto_reset: True
-    use_spacemouse: True
+    ignore_terminations: False
+    auto_reset: False
+    use_spacemouse: False
     override_cfg:
       calibration_path: null
-      target_ee_pose: [0.2, 0.0, 0.1, 0.0, 0.0, 0.0]
-      # Phase2 低风险：低频、小幅度、不弹窗
-      step_frequency: 2.0
-      action_scale: [0.005, 0.05, 1.0]
-      enable_camera_player: false
+      target_ee_pose: [0.3, 0.0, 0.2, 0.0, 0.0, 0.0]
+      success_position_error_m: 0.02
+      success_orientation_error_deg: 30.0
+      reset_position: [0.2, 0.0, 0.1, 0.0, 0.0]
+      check_orientation: false

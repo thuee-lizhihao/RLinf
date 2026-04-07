@@ -15,11 +15,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import queue
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import gymnasium as gym
@@ -53,11 +54,16 @@ class SO101RobotConfig:
     target_frame_name: str = "gripper_frame_link"
     ik_position_weight: float = 1.0
     ik_orientation_weight: float = 0.01
+    ik_position_only_orientation_weight: float = 0.0
+    ik_position_error_threshold_m: float = 0.02
+    ik_orientation_error_threshold_deg: float = 30.0
 
     # Reset / safety
     joint_reset_qpos: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0]
     )
+    enable_random_reset: bool = False
+    random_reset_joint_delta_deg: np.ndarray = field(default_factory=lambda: np.zeros(5))
     ee_pose_limit_min: np.ndarray = field(
         default_factory=lambda: np.array(
             [
@@ -87,6 +93,15 @@ class SO101RobotConfig:
     tcp_linear_vel_max: float = 1.0
     tcp_angular_vel_max: float = 10.0
     tcp_pose_jump_warn_threshold: float = 0.05
+    max_xyz_step_m: float = 0.05
+    max_rpy_step_rad: float = 0.3
+    max_joint_step_delta_deg: float = 8.0
+    joint_tolerance_deg: float = 3.0
+    step_timeout_s: float = 0.5
+    reset_joint_tolerance_deg: float = 4.0
+    reset_max_step_delta_deg: float = 4.0
+    reset_timeout_s: float = 2.0
+    reset_max_iters: int = 6
     max_num_steps: int = 100
 
 
@@ -266,6 +281,114 @@ class SO101Env(gym.Env):
         pose[3:] = R.from_euler("xyz", euler).as_quat()
         return pose
 
+    def _clip_action_deltas(self, xyz_delta: np.ndarray, rpy_delta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        clipped_xyz = np.clip(
+            np.asarray(xyz_delta, dtype=float),
+            -float(self.config.max_xyz_step_m),
+            float(self.config.max_xyz_step_m),
+        )
+        clipped_rpy = np.clip(
+            np.asarray(rpy_delta, dtype=float),
+            -float(self.config.max_rpy_step_rad),
+            float(self.config.max_rpy_step_rad),
+        )
+        return clipped_xyz, clipped_rpy
+
+    def _limit_joint_step(self, q_curr: np.ndarray, q_target: np.ndarray, max_step: float) -> tuple[np.ndarray, bool]:
+        delta = np.asarray(q_target, dtype=float) - np.asarray(q_curr, dtype=float)
+        clipped_delta = np.clip(delta, -float(max_step), float(max_step))
+        clipped = bool(np.any(np.abs(clipped_delta - delta) > 1e-9))
+        return np.asarray(q_curr, dtype=float) + clipped_delta, clipped
+
+    @staticmethod
+    def _pose7_to_matrix(pose7: np.ndarray) -> np.ndarray:
+        T = np.eye(4, dtype=float)
+        T[:3, :3] = R.from_quat(np.asarray(pose7[3:], dtype=float)).as_matrix()
+        T[:3, 3] = np.asarray(pose7[:3], dtype=float)
+        return T
+
+    def _solve_ik_with_fallback(self, q_curr: np.ndarray, desired_pose7: np.ndarray) -> tuple[np.ndarray, dict]:
+        assert self._kin is not None
+        T_des = self._pose7_to_matrix(desired_pose7)
+        diag: dict[str, float | str | bool] = {
+            "ik_fallback_level": "hold_current",
+            "ik_converged": False,
+            "ik_position_error_m": np.nan,
+            "ik_orientation_error_deg": np.nan,
+            "ik_exception": False,
+            "ik_retry_used": False,
+            "ik_retry_attempt": 0,
+        }
+
+        try:
+            full = self._kin.inverse_kinematics_with_result(
+                current_joint_pos_deg=q_curr,
+                desired_ee_pose=T_des,
+                position_weight=float(self.config.ik_position_weight),
+                orientation_weight=float(self.config.ik_orientation_weight),
+                position_error_threshold_m=float(self.config.ik_position_error_threshold_m),
+                orientation_error_threshold_deg=float(self.config.ik_orientation_error_threshold_deg),
+                check_orientation=True,
+            )
+            diag["ik_position_error_m"] = full.position_error_m
+            diag["ik_orientation_error_deg"] = full.orientation_error_deg
+            if full.converged:
+                diag["ik_fallback_level"] = "full"
+                diag["ik_converged"] = True
+                return full.joint_pos_deg.astype(float), diag
+        except Exception as e:
+            self._logger.warning(f"SO101 full IK failed: {e}")
+            diag["ik_exception"] = True
+
+        try:
+            pos_only = self._kin.inverse_kinematics_with_result(
+                current_joint_pos_deg=q_curr,
+                desired_ee_pose=T_des,
+                position_weight=float(self.config.ik_position_weight),
+                orientation_weight=float(self.config.ik_position_only_orientation_weight),
+                position_error_threshold_m=float(self.config.ik_position_error_threshold_m),
+                orientation_error_threshold_deg=float(self.config.ik_orientation_error_threshold_deg),
+                check_orientation=False,
+            )
+            diag["ik_position_error_m"] = pos_only.position_error_m
+            diag["ik_orientation_error_deg"] = pos_only.orientation_error_deg
+            if pos_only.converged:
+                diag["ik_fallback_level"] = "position_only"
+                diag["ik_converged"] = True
+                diag["ik_exception"] = False  # Reset: valid fallback solution obtained
+                return pos_only.joint_pos_deg.astype(float), diag
+        except Exception as e:
+            self._logger.warning(f"SO101 position-only IK failed: {e}")
+            diag["ik_exception"] = True
+
+        # Position-only IK can be non-deterministic near singular/branch boundaries.
+        # A short retry often recovers a valid solution without changing control policy.
+        for retry_idx in range(2):
+            try:
+                pos_only_retry = self._kin.inverse_kinematics_with_result(
+                    current_joint_pos_deg=q_curr,
+                    desired_ee_pose=T_des,
+                    position_weight=float(self.config.ik_position_weight),
+                    orientation_weight=float(self.config.ik_position_only_orientation_weight),
+                    position_error_threshold_m=float(self.config.ik_position_error_threshold_m),
+                    orientation_error_threshold_deg=float(self.config.ik_orientation_error_threshold_deg),
+                    check_orientation=False,
+                )
+                diag["ik_position_error_m"] = pos_only_retry.position_error_m
+                diag["ik_orientation_error_deg"] = pos_only_retry.orientation_error_deg
+                if pos_only_retry.converged:
+                    diag["ik_fallback_level"] = "position_only_retry"
+                    diag["ik_converged"] = True
+                    diag["ik_exception"] = False
+                    diag["ik_retry_used"] = True
+                    diag["ik_retry_attempt"] = int(retry_idx + 1)
+                    return pos_only_retry.joint_pos_deg.astype(float), diag
+            except Exception as e:
+                self._logger.warning(f"SO101 position-only IK retry failed: {e}")
+                diag["ik_exception"] = True
+
+        return np.asarray(q_curr, dtype=float).copy(), diag
+
     def _refresh_state_from_controller(self) -> SO101RobotState:
         assert self._controller is not None
         self._state = self._controller.sync_state().wait()[0]
@@ -288,8 +411,156 @@ class SO101Env(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._num_steps = 0
+        info: dict[str, float | bool | str] = {}
+        if not self.config.is_dummy:
+            try:
+                rest_info = self.go_to_rest()
+                info.update(rest_info)
+            except Exception as e:
+                self._logger.warning(f"SO101 reset go_to_rest failed (non-fatal): {e}")
+                info["reset_go_to_rest_ok"] = False
+                info["reset_error"] = str(e)
         obs = self._get_observation()
-        return obs, {}
+        return obs, info
+
+    def go_to_rest(self) -> dict[str, float | bool]:
+        if self.config.is_dummy:
+            return {"reset_go_to_rest_ok": True, "reset_iters": 0}
+        assert self._controller is not None
+
+        def _append_debug_log(
+            run_id: str,
+            hypothesis_id: str,
+            location: str,
+            message: str,
+            data: dict[str, Any],
+        ) -> None:
+            payload = {
+                "sessionId": "c6202f",
+                "runId": run_id,
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }
+            try:
+                with Path("/home/zhihao/SO101_arm/.cursor/debug-c6202f.log").open(
+                    "a", encoding="utf-8"
+                ) as f:
+                    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+        run_id = f"reset_ep{self._num_steps}"
+        reset_guard_band_deg = 0.5
+        applied_reset_step_limit_deg = max(
+            0.1,
+            float(self.config.reset_max_step_delta_deg) - float(reset_guard_band_deg),
+        )
+        self._refresh_state_from_controller()
+        q_target = np.asarray(self.config.joint_reset_qpos, dtype=float).reshape(5)
+
+        if self.config.enable_random_reset:
+            noise = np.asarray(self.config.random_reset_joint_delta_deg, dtype=float).reshape(5)
+            q_target = q_target + np.random.uniform(-noise, noise)
+
+        q_curr = self._state.arm_joint_position.astype(float).reshape(5)
+        iters = 0
+        success = False
+        max_err = float(np.max(np.abs(q_target - q_curr)))
+        # region agent log
+        _append_debug_log(
+            run_id=run_id,
+            hypothesis_id="R1",
+            location="so101_env.py:go_to_rest:entry",
+            message="Reset entry state and target.",
+            data={
+                "q_curr_deg": q_curr.tolist(),
+                "q_target_deg": q_target.tolist(),
+                "max_err_deg": float(max_err),
+                "applied_reset_step_limit_deg": float(applied_reset_step_limit_deg),
+                "reset_max_step_delta_deg": float(self.config.reset_max_step_delta_deg),
+                "reset_guard_band_deg": float(reset_guard_band_deg),
+                "reset_joint_tolerance_deg": float(self.config.reset_joint_tolerance_deg),
+            },
+        )
+        # endregion
+        while iters < int(self.config.reset_max_iters):
+            iters += 1
+            q_next, _ = self._limit_joint_step(
+                q_curr, q_target, max_step=float(applied_reset_step_limit_deg)
+            )
+            # region agent log
+            _append_debug_log(
+                run_id=run_id,
+                hypothesis_id="R2",
+                location="so101_env.py:go_to_rest:pre_move",
+                message="Reset loop command before move_joints_blocking.",
+                data={
+                    "iter": int(iters),
+                    "q_curr_deg": q_curr.tolist(),
+                    "q_next_deg": np.asarray(q_next, dtype=float).tolist(),
+                    "max_abs_cmd_delta_deg": float(np.max(np.abs(np.asarray(q_next) - q_curr))),
+                    "applied_reset_step_limit_deg": float(applied_reset_step_limit_deg),
+                    "configured_reset_step_limit_deg": float(self.config.reset_max_step_delta_deg),
+                },
+            )
+            # endregion
+            try:
+                move_res = self._controller.move_joints_blocking(
+                    q_next,
+                    gripper_pos=None,
+                    timeout_s=float(self.config.reset_timeout_s),
+                    joint_tolerance_deg=float(self.config.reset_joint_tolerance_deg),
+                    max_step_delta_deg=float(self.config.reset_max_step_delta_deg),
+                    raise_on_fail=False,
+                ).wait()[0]
+            except Exception as e:
+                # region agent log
+                _append_debug_log(
+                    run_id=run_id,
+                    hypothesis_id="R4",
+                    location="so101_env.py:go_to_rest:move_exception",
+                    message="Reset move raised exception in controller.",
+                    data={
+                        "iter": int(iters),
+                        "exception_type": type(e).__name__,
+                        "exception_text": str(e),
+                        "max_abs_cmd_delta_deg": float(np.max(np.abs(np.asarray(q_next) - q_curr))),
+                        "applied_reset_step_limit_deg": float(applied_reset_step_limit_deg),
+                        "configured_reset_step_limit_deg": float(self.config.reset_max_step_delta_deg),
+                    },
+                )
+                # endregion
+                raise
+            q_curr = np.asarray(move_res.readback_joint_deg, dtype=float).reshape(5)
+            max_err = float(np.max(np.abs(q_target - q_curr)))
+            # region agent log
+            _append_debug_log(
+                run_id=run_id,
+                hypothesis_id="R3",
+                location="so101_env.py:go_to_rest:post_move",
+                message="Reset loop move result and readback.",
+                data={
+                    "iter": int(iters),
+                    "move_success": bool(move_res.success),
+                    "move_timed_out": bool(move_res.timed_out),
+                    "move_max_joint_error_deg": float(move_res.max_joint_error_deg),
+                    "readback_joint_deg": np.asarray(move_res.readback_joint_deg, dtype=float).tolist(),
+                    "remaining_max_err_deg": float(max_err),
+                },
+            )
+            # endregion
+            if max_err <= float(self.config.reset_joint_tolerance_deg) + 1e-9:
+                success = True
+                break
+
+        return {
+            "reset_go_to_rest_ok": bool(success),
+            "reset_iters": int(iters),
+            "reset_target_max_err_deg": float(max_err),
+        }
 
     def step(self, action: np.ndarray):
         start_time = time.time()
@@ -307,8 +578,9 @@ class SO101Env(gym.Env):
         self._refresh_state_from_controller()
 
         # Build desired tcp pose by applying deltas
-        xyz_delta = action[:3] * float(self.config.action_scale[0])
-        rpy_delta = action[3:6] * float(self.config.action_scale[1])
+        xyz_delta_raw = action[:3] * float(self.config.action_scale[0])
+        rpy_delta_raw = action[3:6] * float(self.config.action_scale[1])
+        xyz_delta, rpy_delta = self._clip_action_deltas(xyz_delta_raw, rpy_delta_raw)
         gripper_cmd = float(action[6] * float(self.config.action_scale[2]))
 
         desired_pose = self._state.tcp_pose.copy()
@@ -316,43 +588,50 @@ class SO101Env(gym.Env):
         desired_pose[3:] = (
             R.from_euler("xyz", rpy_delta) * R.from_quat(desired_pose[3:].copy())
         ).as_quat()
+        unclipped_desired_pose = desired_pose.copy()
         desired_pose = self._clip_pose_to_limits(desired_pose)
 
-        # Convert desired pose to 4x4
-        T_des = np.eye(4, dtype=float)
-        T_des[:3, :3] = R.from_quat(desired_pose[3:].copy()).as_matrix()
-        T_des[:3, 3] = desired_pose[:3]
-
         q_curr = self._state.arm_joint_position.astype(float)
-        try:
-            q_target = self._kin.inverse_kinematics(
-                q_curr,
-                T_des,
-                position_weight=self.config.ik_position_weight,
-                orientation_weight=self.config.ik_orientation_weight,
-            )
-        except Exception as e:
-            self._logger.warning(f"SO101 IK failed, keeping current joints. Error: {e}")
-            q_target = q_curr
+        q_target_raw, ik_diag = self._solve_ik_with_fallback(q_curr, desired_pose)
+        q_target, clipped_by_joint_step = self._limit_joint_step(
+            q_curr, q_target_raw, max_step=float(self.config.max_joint_step_delta_deg)
+        )
 
         # Gripper: binary open/close
         is_gripper_effective = False
-        if gripper_cmd <= -self.config.binary_gripper_threshold:
-            self._controller.close_gripper().wait()
-            is_gripper_effective = True
-        elif gripper_cmd >= self.config.binary_gripper_threshold:
-            self._controller.open_gripper().wait()
-            is_gripper_effective = True
+        gripper_error = False
+        try:
+            if gripper_cmd <= -self.config.binary_gripper_threshold:
+                self._controller.close_gripper().wait()
+                is_gripper_effective = True
+            elif gripper_cmd >= self.config.binary_gripper_threshold:
+                self._controller.open_gripper().wait()
+                is_gripper_effective = True
+        except Exception as e:
+            gripper_error = True
+            self._logger.warning(f"SO101 gripper command failed (non-fatal): {e}")
 
         # Send joint targets using blocking wrapper.
-        self._controller.move_joints_blocking(
-            q_target,
-            gripper_pos=None,
-            timeout_s=max(0.5, 1.0 / float(self.config.step_frequency)),
-            joint_tolerance_deg=3.0,
-            max_step_delta_deg=5.0,
-            raise_on_fail=False,
-        ).wait()
+        move_success = False
+        move_timed_out = False
+        move_max_joint_error_deg = np.nan
+        try:
+            _move_timeout_budget = max(
+                float(self.config.step_timeout_s), 1.0 / float(self.config.step_frequency)
+            )
+            move_res = self._controller.move_joints_blocking(
+                q_target,
+                gripper_pos=None,
+                timeout_s=_move_timeout_budget,
+                joint_tolerance_deg=float(self.config.joint_tolerance_deg),
+                max_step_delta_deg=float(self.config.max_joint_step_delta_deg),
+                raise_on_fail=False,
+            ).wait()[0]
+            move_success = bool(move_res.success)
+            move_timed_out = bool(move_res.timed_out)
+            move_max_joint_error_deg = float(move_res.max_joint_error_deg)
+        except Exception as e:
+            self._logger.warning(f"SO101 joint move failed (non-fatal): {e}")
 
         self._num_steps += 1
         # rate limit
@@ -363,7 +642,24 @@ class SO101Env(gym.Env):
         reward = 0.0
         terminated = False
         truncated = self._num_steps >= self.config.max_num_steps
-        info = {"gripper_effective": is_gripper_effective}
+        info = {
+            "gripper_effective": is_gripper_effective,
+            "gripper_command_error": gripper_error,
+            "action_xyz_delta_clipped": bool(np.any(np.abs(xyz_delta - xyz_delta_raw) > 1e-9)),
+            "action_rpy_delta_clipped": bool(np.any(np.abs(rpy_delta - rpy_delta_raw) > 1e-9)),
+            "desired_pose_clipped_to_limits": bool(
+                np.any(np.abs(desired_pose - unclipped_desired_pose) > 1e-9)
+            ),
+            "joint_step_clipped": clipped_by_joint_step,
+            "move_success": move_success,
+            "move_timed_out": move_timed_out,
+            "move_max_joint_error_deg": move_max_joint_error_deg,
+            "ik_fallback_level": ik_diag["ik_fallback_level"],
+            "ik_converged": ik_diag["ik_converged"],
+            "ik_position_error_m": ik_diag["ik_position_error_m"],
+            "ik_orientation_error_deg": ik_diag["ik_orientation_error_deg"],
+            "ik_exception": ik_diag["ik_exception"],
+        }
         return obs, reward, terminated, truncated, info
 
     def close(self):

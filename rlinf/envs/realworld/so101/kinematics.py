@@ -14,7 +14,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+@dataclass
+class SO101IKResult:
+    joint_pos_deg: np.ndarray
+    position_error_m: float
+    orientation_error_deg: float
+    converged: bool
 
 
 class SO101Kinematics:
@@ -63,6 +73,28 @@ class SO101Kinematics:
         position_weight: float = 1.0,
         orientation_weight: float = 0.01,
     ) -> np.ndarray:
+        result = self.inverse_kinematics_with_result(
+            current_joint_pos_deg=current_joint_pos_deg,
+            desired_ee_pose=desired_ee_pose,
+            position_weight=position_weight,
+            orientation_weight=orientation_weight,
+            position_error_threshold_m=np.inf,
+            orientation_error_threshold_deg=np.inf,
+            check_orientation=orientation_weight > 0.0,
+        )
+        return result.joint_pos_deg
+
+    def inverse_kinematics_with_result(
+        self,
+        current_joint_pos_deg: np.ndarray,
+        desired_ee_pose: np.ndarray,
+        position_weight: float = 1.0,
+        orientation_weight: float = 0.01,
+        position_error_threshold_m: float = 0.02,
+        orientation_error_threshold_deg: float = 30.0,
+        check_orientation: bool = True,
+        max_iterations: int = 100,
+    ) -> SO101IKResult:
         current_joint_pos_deg = np.asarray(current_joint_pos_deg, dtype=float).reshape(-1)
         current_joint_rad = np.deg2rad(current_joint_pos_deg[: len(self.joint_names)])
         for i, joint_name in enumerate(self.joint_names):
@@ -72,9 +104,36 @@ class SO101Kinematics:
         self.tip_frame.configure(
             self.target_frame_name, "soft", position_weight, orientation_weight
         )
-        self.solver.solve(True)
-        self.robot.update_kinematics()
+
+        n_iters = max(1, max_iterations)
+        for _ in range(n_iters):
+            self.solver.solve(True)
+            self.robot.update_kinematics()
 
         joint_pos_rad = [self.robot.get_joint(j) for j in self.joint_names]
-        return np.rad2deg(joint_pos_rad)
+        joint_pos_deg = np.rad2deg(joint_pos_rad)
+
+        achieved_pose = self.forward_kinematics(joint_pos_deg)
+        position_error_m = float(np.linalg.norm(achieved_pose[:3, 3] - desired_ee_pose[:3, 3]))
+        if check_orientation:
+            orientation_error_deg = float(
+                np.linalg.norm(
+                    (
+                        R.from_matrix(achieved_pose[:3, :3].copy())
+                        * R.from_matrix(desired_ee_pose[:3, :3].copy()).inv()
+                    ).as_rotvec()
+                )
+                * (180.0 / np.pi)
+            )
+        else:
+            orientation_error_deg = 0.0
+        converged = bool(position_error_m <= position_error_threshold_m) and bool(
+            (not check_orientation) or (orientation_error_deg <= orientation_error_threshold_deg)
+        )
+        return SO101IKResult(
+            joint_pos_deg=np.asarray(joint_pos_deg, dtype=float),
+            position_error_m=position_error_m,
+            orientation_error_deg=orientation_error_deg,
+            converged=converged,
+        )
 
