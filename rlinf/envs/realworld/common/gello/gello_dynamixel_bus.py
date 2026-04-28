@@ -67,6 +67,36 @@ class GelloDynamixelBus:
         with self._lock:
             return self.driver.set_joints(joints_arr)
 
+    def write_currents(self, currents: Sequence[float] | np.ndarray) -> Any:
+        """Write raw motor current targets through the shared driver."""
+        currents_arr = np.asarray(currents, dtype=np.float64)
+        with self._lock:
+            return self.driver.set_current(currents_arr)
+
+    def read_positions_and_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read raw positions and velocities from the shared driver."""
+        with self._lock:
+            positions, velocities = self.driver.get_positions_and_velocities()
+            return (
+                np.asarray(positions, dtype=np.float64),
+                np.asarray(velocities, dtype=np.float64),
+            )
+
+    def set_operating_mode(self, mode: int) -> Any:
+        """Set the raw driver operating mode while holding the bus lock."""
+        with self._lock:
+            return self.driver.set_operating_mode(mode)
+
+    def verify_operating_mode(self, expected_mode: int) -> Any:
+        """Verify the raw driver operating mode while holding the bus lock."""
+        with self._lock:
+            return self.driver.verify_operating_mode(expected_mode)
+
+    def set_torque_enabled(self, enabled: bool) -> Any:
+        """Enable or disable Dynamixel torque while holding the bus lock."""
+        with self._lock:
+            return self.driver.set_torque_mode(enabled)
+
     def call_locked(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """Call an arbitrary driver method while holding the bus lock.
 

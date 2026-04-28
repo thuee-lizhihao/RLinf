@@ -14,11 +14,14 @@
 
 from .gello_dynamixel_bus import GelloDynamixelBus
 from .gello_expert import GelloExpert
+from .gello_joint_actuator import GelloJointActuator, GelloJointActuatorResult
 from .gello_joint_expert import GelloJointExpert
 from .gello_joint_mapper import GelloJointMapper
 
 __all__ = [
     "GelloExpert",
+    "GelloJointActuator",
+    "GelloJointActuatorResult",
     "GelloDynamixelBus",
     "GelloJointExpert",
     "GelloJointMapper",
