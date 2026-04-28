@@ -23,6 +23,7 @@ from .dual_gello_joint_intervention import DualGelloJointIntervention
 from .dual_relative_frame import DualRelativeFrame, DualRelativeTargetFrame
 from .dual_spacemouse_intervention import DualSpacemouseIntervention
 from .euler_obs import Quat2EulerWrapper
+from .gello_alignment_keyboard_wrapper import GelloAlignmentKeyboardWrapper
 from .gello_intervention import GelloIntervention
 from .gripper_close import GripperCloseEnv
 from .keyboard_start_end_wrapper import KeyboardStartEndWrapper
@@ -42,6 +43,7 @@ __all__ = [
     "DualRelativeTargetFrame",
     "DualSpacemouseIntervention",
     "GelloIntervention",
+    "GelloAlignmentKeyboardWrapper",
     "GripperCloseEnv",
     "KeyboardRewardDoneMultiStageWrapper",
     "KeyboardRewardDoneWrapper",

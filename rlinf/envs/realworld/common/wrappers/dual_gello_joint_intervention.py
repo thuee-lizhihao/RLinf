@@ -557,4 +557,8 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._release_actuators()
         self.left_expert.close()
         self.right_expert.close()
+        for actuator in (self.left_actuator, self.right_actuator):
+            close = getattr(actuator, "close", None)
+            if callable(close):
+                close()
         return super().close()

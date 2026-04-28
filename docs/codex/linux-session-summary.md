@@ -143,3 +143,47 @@ Continue with `docs/codex/next-steps.md`:
 2. Commit 3: implement the `policy -> aligning -> aligned -> teleop` state
    machine.
 3. Commit 4: add keyboard, config, and docs for the alignment flow.
+
+## 2026-04-29 Draft Progress
+
+The owner approved writing high-quality first drafts locally overnight, then
+running heavy dependency and real hardware validation on the shared lab machine.
+
+Local commits completed after commit 1:
+
+- `feat(gello): add shared-bus leader actuator`
+  - Adds `GelloJointActuator`.
+  - Adds current-mode `factr_pd` alignment.
+  - Adds position-control fallback.
+  - Adds release-on-timeout and release-on-error behavior.
+  - Adds mock actuator unit tests.
+- `feat(gello): gate teleop with leader alignment`
+  - Adds `policy -> aligning -> aligned -> teleop` state API.
+  - Adds `request_align()`, `confirm_teleop()`, and `cancel_to_policy()`.
+  - Ensures `aligning` and `aligned` freeze Franka actions.
+  - Ensures direct streaming only sends in `teleop`.
+  - Adds mock state-machine unit tests.
+- `feat(gello): add keyboard-controlled alignment flow`
+  - Adds keyboard mapping:
+    - `t`: request alignment.
+    - `y`: confirm teleop after aligned.
+    - `p`: cancel/back to policy.
+  - Updates the dual-Franka GELLO collection YAML to start in `policy`.
+  - Wires shared bus, mapper, reader, actuator, and keyboard wrapper when
+    `gello_align_on_intervention: true`.
+
+Local lightweight validation:
+
+```bash
+python -m py_compile <changed-python-files>
+```
+
+Heavy validation still belongs on the shared lab machine:
+
+1. Run the unit tests added for commits 1-4.
+2. Run `ruff check` and `ruff format --check` on changed files.
+3. Repeat commit 1 GELLO reader smoke tests.
+4. Test commit 2 actuator alone with Franka disconnected.
+5. Test commit 3/4 with fake or disabled actuator before allowing real motion.
+6. Test the final hardware sequence:
+   `policy -> t -> aligning -> aligned -> y -> teleop -> p -> policy`.

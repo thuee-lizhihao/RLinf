@@ -83,6 +83,15 @@ env:
     # Override here only if you swap GELLO units for a session.
     left_gello_port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAJEDPC-if00-port0"
     right_gello_port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAM5DHY-if00-port0"
+    gello_default_mode: "policy"
+    gello_align_on_intervention: true
+    gello_align_strategy: "factr_pd"
+    gello_align_tolerance: 0.06
+    gello_align_timeout: 5.0
+    gello_align_dwell_steps: 5
+    gello_align_current_limit: []
+    gello_align_kp: []
+    gello_align_kd: []
     override_cfg:
       task_description: "pick up the cylinder with the left hand, hand it over to the right hand, and place it on the plate"
       joint_action_mode: "absolute"

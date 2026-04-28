@@ -20,7 +20,15 @@ from collections import deque
 class KeyboardListener:
     """Headless keyboard listener backed by Linux evdev input devices."""
 
-    REQUIRED_KEY_NAMES = ("KEY_A", "KEY_B", "KEY_C", "KEY_Q")
+    REQUIRED_KEY_NAMES = (
+        "KEY_A",
+        "KEY_B",
+        "KEY_C",
+        "KEY_P",
+        "KEY_Q",
+        "KEY_T",
+        "KEY_Y",
+    )
 
     def __init__(self):
         try:

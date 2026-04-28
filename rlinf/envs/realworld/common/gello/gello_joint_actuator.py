@@ -222,6 +222,11 @@ class GelloJointActuator:
         except Exception:
             pass
 
+    def close(self) -> None:
+        """Release torque and close the shared bus."""
+        self.emergency_release()
+        self.bus.close()
+
     def _set_control_mode(self, mode: int) -> None:
         self.disable_torque()
         self.bus.set_operating_mode(mode)

@@ -20,6 +20,12 @@ from typing import Any, Mapping, Optional
 
 import gymnasium as gym
 
+from rlinf.envs.realworld.common.gello import (
+    GelloDynamixelBus,
+    GelloJointActuator,
+    GelloJointExpert,
+    GelloJointMapper,
+)
 from rlinf.envs.realworld.common.wrappers.dual_euler_obs import (
     DualQuat2EulerWrapper,
 )
@@ -36,6 +42,9 @@ from rlinf.envs.realworld.common.wrappers.dual_spacemouse_intervention import (
     DualSpacemouseIntervention,
 )
 from rlinf.envs.realworld.common.wrappers.euler_obs import Quat2EulerWrapper
+from rlinf.envs.realworld.common.wrappers.gello_alignment_keyboard_wrapper import (
+    GelloAlignmentKeyboardWrapper,
+)
 from rlinf.envs.realworld.common.wrappers.gello_intervention import (
     GelloIntervention,
 )
@@ -71,6 +80,22 @@ def _apply_keyboard_reward(env: gym.Env, mode: Optional[str]) -> gym.Env:
     if mode == "start_end":
         return KeyboardStartEndWrapper(env)
     return env
+
+
+def _empty_to_none(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if hasattr(value, "__len__") and len(value) == 0:
+        return None
+    return value
+
+
+def _make_mapper(cfg: Mapping[str, Any], prefix: str) -> GelloJointMapper:
+    signs = _empty_to_none(cfg.get(f"{prefix}_gello_joint_signs", None))
+    offsets = _empty_to_none(cfg.get(f"{prefix}_gello_joint_offsets", None))
+    if signs is None and offsets is None:
+        return GelloJointMapper()
+    return GelloJointMapper(signs=signs, offsets=offsets)
 
 
 def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
@@ -186,6 +211,33 @@ def apply_dual_arm_franky_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.
                 "use_gello_joint=True requires both "
                 "'left_gello_port' and 'right_gello_port' in the env config."
             )
+        align_on_intervention = cfg.get("gello_align_on_intervention", False)
+        left_expert = None
+        right_expert = None
+        left_actuator = None
+        right_actuator = None
+        if align_on_intervention:
+            left_mapper = _make_mapper(cfg, "left")
+            right_mapper = _make_mapper(cfg, "right")
+            left_bus = GelloDynamixelBus(port=left_port)
+            right_bus = GelloDynamixelBus(port=right_port)
+            left_expert = GelloJointExpert(bus=left_bus, mapper=left_mapper)
+            right_expert = GelloJointExpert(bus=right_bus, mapper=right_mapper)
+            current_limit = _empty_to_none(cfg.get("gello_align_current_limit", None))
+            left_actuator = GelloJointActuator(
+                bus=left_bus,
+                mapper=left_mapper,
+                current_limit=current_limit,
+                kp=_empty_to_none(cfg.get("gello_align_kp", None)),
+                kd=_empty_to_none(cfg.get("gello_align_kd", None)),
+            )
+            right_actuator = GelloJointActuator(
+                bus=right_bus,
+                mapper=right_mapper,
+                current_limit=current_limit,
+                kp=_empty_to_none(cfg.get("gello_align_kp", None)),
+                kd=_empty_to_none(cfg.get("gello_align_kd", None)),
+            )
         env = DualGelloJointIntervention(
             env,
             left_port=left_port,
@@ -196,7 +248,22 @@ def apply_dual_arm_franky_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.
             direct_stream=getattr(env.config, "teleop_direct_stream", False),
             stream_period=cfg.get("gello_joint_stream_period", 0.001),
             default_mode=cfg.get("gello_default_mode", "teleop"),
+            left_expert=left_expert,
+            right_expert=right_expert,
+            left_actuator=left_actuator,
+            right_actuator=right_actuator,
+            align_strategy=cfg.get("gello_align_strategy", "factr_pd"),
+            align_tolerance=cfg.get("gello_align_tolerance", 0.06),
+            align_timeout=cfg.get("gello_align_timeout", 5.0),
+            align_dwell_steps=cfg.get("gello_align_dwell_steps", 5),
+            align_current_limit=_empty_to_none(
+                cfg.get("gello_align_current_limit", None)
+            ),
+            align_kp=_empty_to_none(cfg.get("gello_align_kp", None)),
+            align_kd=_empty_to_none(cfg.get("gello_align_kd", None)),
         )
+        if align_on_intervention:
+            env = GelloAlignmentKeyboardWrapper(env)
 
     env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
     return env
