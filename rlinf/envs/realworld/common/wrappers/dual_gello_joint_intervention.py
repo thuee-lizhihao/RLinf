@@ -19,34 +19,37 @@ mode (daemon thread pushes joint targets to each controller at ~1 kHz,
 bypassing env.step's rate gate — pair with
 ``DualFrankaJointRobotConfig.teleop_direct_stream=True``).
 
-Three runtime modes selectable via :meth:`set_mode` (default chosen at
-construction time, typically wired through the YAML
-``gello_default_mode`` field):
+Runtime modes selectable through the state API:
 
 * ``"policy"`` — pass the upstream action through unchanged. GELLO is
   ignored. Intended for HG-DAgger rollouts where the policy drives the
   robot until the human clutches in.
-* ``"homing"`` — issue a "stay-in-place" target for both arms (current
-  joints + neutral grippers in absolute mode, zero vector in delta
-  mode). The robot keeps responding every step but does not advance;
-  an external GELLO actuator can use this window to slew the leader to
-  the Franka's joints before teleop hand-off.
+* ``"aligning"`` — freeze the Franka at the current joint snapshot while
+  the GELLO leader actuator moves to the same joints.
+* ``"aligned"`` — keep the Franka frozen after GELLO alignment, waiting
+  for an explicit human confirmation.
 * ``"teleop"`` — overlay the live GELLO joint stream on the action
-  (the legacy collection behaviour). This is the default to preserve
-  existing pure-teleop YAMLs.
+  and allow direct-streaming to Franka controllers.
+
+``"homing"`` is still accepted as a legacy freeze-only alias.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Sequence
 
 import gymnasium as gym
 import numpy as np
 
+from rlinf.envs.realworld.common.gello.gello_joint_actuator import (
+    GelloJointActuator,
+    GelloJointActuatorResult,
+)
 from rlinf.envs.realworld.common.gello.gello_joint_expert import GelloJointExpert
 
-_VALID_MODES = ("policy", "homing", "teleop")
+_VALID_MODES = ("policy", "homing", "aligning", "aligned", "teleop")
 
 
 class DualGelloJointIntervention(gym.ActionWrapper):
@@ -81,14 +84,27 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         direct_stream: bool = False,
         stream_period: float = 0.001,
         default_mode: str = "teleop",
-    ):
+        left_expert: GelloJointExpert | None = None,
+        right_expert: GelloJointExpert | None = None,
+        left_actuator: GelloJointActuator | None = None,
+        right_actuator: GelloJointActuator | None = None,
+        align_strategy: str = "factr_pd",
+        align_tolerance: float = 0.06,
+        align_timeout: float = 5.0,
+        align_dwell_steps: int = 5,
+        align_current_limit: Sequence[float] | np.ndarray | None = None,
+        align_kp: Sequence[float] | np.ndarray | None = None,
+        align_kd: Sequence[float] | np.ndarray | None = None,
+    ) -> None:
         super().__init__(env)
 
         self.gripper_enabled = gripper_enabled
         self.use_delta = use_delta
         self.action_scale = action_scale
-        self.left_expert = GelloJointExpert(port=left_port)
-        self.right_expert = GelloJointExpert(port=right_port)
+        self.left_expert = left_expert or GelloJointExpert(port=left_port)
+        self.right_expert = right_expert or GelloJointExpert(port=right_port)
+        self.left_actuator = left_actuator
+        self.right_actuator = right_actuator
         self.last_intervene = 0.0
 
         if default_mode not in _VALID_MODES:
@@ -107,6 +123,26 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._stream_paused = threading.Event()
         self._stream_paused.set()  # starts unpaused
 
+        if align_strategy not in ("factr_pd", "position"):
+            raise ValueError(
+                "align_strategy must be one of ('factr_pd', 'position'), got "
+                f"{align_strategy!r}"
+            )
+        self._align_strategy = align_strategy
+        self._align_tolerance = align_tolerance
+        self._align_timeout = align_timeout
+        self._align_dwell_steps = align_dwell_steps
+        self._align_current_limit = self._empty_to_none(align_current_limit)
+        self._align_kp = self._empty_to_none(align_kp)
+        self._align_kd = self._empty_to_none(align_kd)
+        self._align_thread: threading.Thread | None = None
+        self._align_snapshot: np.ndarray | None = None
+        self._align_error = np.full(14, np.inf, dtype=np.float64)
+        self._align_ready = False
+
+        if self.mode != "teleop":
+            self._stream_paused.clear()
+
     # ------------------------------------------------------------------
     # Mode API
     # ------------------------------------------------------------------
@@ -116,11 +152,147 @@ class DualGelloJointIntervention(gym.ActionWrapper):
             raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
         with self._mode_lock:
             self._mode = mode
+        if mode == "teleop":
+            self._stream_paused.set()
+            if self._direct_stream and self._stream_thread is None:
+                self._start_stream_thread()
+        else:
+            self._stream_paused.clear()
 
     @property
     def mode(self) -> str:
         with self._mode_lock:
             return self._mode
+
+    def request_align(self) -> bool:
+        """Start GELLO leader alignment to the current Franka joint snapshot."""
+        if self.left_actuator is None or self.right_actuator is None:
+            self.cancel_to_policy()
+            return False
+        with self._mode_lock:
+            if self._mode == "aligning":
+                return False
+            self._mode = "aligning"
+            self._align_ready = False
+            self._align_error = np.full(14, np.inf, dtype=np.float64)
+            self._align_snapshot = self._get_current_joint_positions().copy()
+
+        self._stream_paused.clear()
+        self._release_actuators()
+
+        self._align_thread = threading.Thread(
+            target=self._run_alignment,
+            name="DualGelloLeaderAlign",
+            daemon=True,
+        )
+        self._align_thread.start()
+        return True
+
+    def confirm_teleop(self) -> bool:
+        """Enter teleop only after an explicit confirmation from aligned mode."""
+        with self._mode_lock:
+            if self._mode != "aligned":
+                return False
+            self._mode = "teleop"
+        self._stream_paused.set()
+        if self._direct_stream and self._stream_thread is None:
+            self._start_stream_thread()
+        return True
+
+    def cancel_to_policy(self) -> None:
+        """Cancel alignment or teleop and return to policy control."""
+        self._stream_paused.clear()
+        self._release_actuators()
+        with self._mode_lock:
+            self._mode = "policy"
+            self._align_ready = False
+
+    def _run_alignment(self) -> None:
+        snapshot = self._align_snapshot
+        if snapshot is None:
+            self.cancel_to_policy()
+            return
+
+        results: list[GelloJointActuatorResult | None] = [None, None]
+        errors: list[BaseException | None] = [None, None]
+
+        def _align_one(index: int, actuator: GelloJointActuator, target: np.ndarray):
+            try:
+                results[index] = self._move_actuator_to_joints(actuator, target)
+            except BaseException as exc:
+                errors[index] = exc
+
+        threads = [
+            threading.Thread(
+                target=_align_one,
+                args=(0, self.left_actuator, snapshot[0]),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_align_one,
+                args=(1, self.right_actuator, snapshot[1]),
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        if any(error is not None for error in errors):
+            self.cancel_to_policy()
+            return
+
+        if results[0] is None or results[1] is None:
+            self.cancel_to_policy()
+            return
+
+        self._align_error = np.concatenate([results[0].error, results[1].error])
+        if results[0].success and results[1].success:
+            with self._mode_lock:
+                if self._mode == "aligning":
+                    self._mode = "aligned"
+                    self._align_ready = True
+            return
+
+        self.cancel_to_policy()
+
+    def _move_actuator_to_joints(
+        self,
+        actuator: GelloJointActuator,
+        target: np.ndarray,
+    ) -> GelloJointActuatorResult:
+        if self._align_strategy == "position":
+            return actuator.move_to_joints_position(
+                target,
+                tolerance=self._align_tolerance,
+                timeout=self._align_timeout,
+                dwell_steps=self._align_dwell_steps,
+            )
+        return actuator.move_to_joints_factr_pd(
+            target,
+            tolerance=self._align_tolerance,
+            timeout=self._align_timeout,
+            dwell_steps=self._align_dwell_steps,
+            current_limit=self._align_current_limit,
+            kp=self._align_kp,
+            kd=self._align_kd,
+        )
+
+    def _release_actuators(self) -> None:
+        for actuator in (self.left_actuator, self.right_actuator):
+            if actuator is not None:
+                actuator.emergency_release()
+
+    def _empty_to_none(
+        self,
+        values: Sequence[float] | np.ndarray | None,
+    ) -> Sequence[float] | np.ndarray | None:
+        if values is None:
+            return None
+        if len(values) == 0:
+            return None
+        return values
 
     def _freeze_action(self) -> np.ndarray:
         """Stay-in-place action under the current action_mode.
@@ -181,6 +353,9 @@ class DualGelloJointIntervention(gym.ActionWrapper):
             self._stream_paused.wait()
             if not self._stream_running:
                 break
+            if self.mode != "teleop":
+                time.sleep(period)
+                continue
 
             loop_start = time.time()
 
@@ -317,25 +492,21 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         return True
 
     def reset(self, **kwargs):
-        """Pause streaming during reset to avoid racing with reset_joint.
-
-        Also tells the inner env to skip its ``reset_joint(home)`` slew:
-        we immediately ``_align_to_gello()`` below, and a "home → GELLO"
-        double-slew just breaks teleop's "tracking continues" feel.
-        """
-        options = dict(kwargs.get("options") or {})
-        options.setdefault("skip_reset_to_home", True)
-        kwargs["options"] = options
-
+        """Pause streaming during reset and restore the configured mode."""
         self._stream_paused.clear()
-        aligned = False
         try:
             result = self.env.reset(**kwargs)
-            if self._direct_stream:
-                aligned = self._align_to_gello()
         finally:
-            self._stream_paused.set()
-            if self._direct_stream and aligned and self._stream_thread is None:
+            with self._mode_lock:
+                self._mode = self._default_mode
+                self._align_ready = False
+            if self.mode == "teleop":
+                self._stream_paused.set()
+            if (
+                self._direct_stream
+                and self.mode == "teleop"
+                and self._stream_thread is None
+            ):
                 self._start_stream_thread()
         return result
 
@@ -345,7 +516,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         if mode == "policy":
             effective = action
             replaced = False
-        elif mode == "homing":
+        elif mode in ("homing", "aligning", "aligned"):
             effective = self._freeze_action()
             replaced = False
         else:  # "teleop"
@@ -364,11 +535,15 @@ class DualGelloJointIntervention(gym.ActionWrapper):
 
         # Lazy-start the 1 kHz streamer if controllers weren't ready
         # at __init__ time.
-        if self._direct_stream and self._stream_thread is None:
+        if self._direct_stream and mode == "teleop" and self._stream_thread is None:
             self._start_stream_thread()
 
         obs, rew, done, truncated, info = self.env.step(effective)
         info["intervene_flag"] = np.array([replaced], dtype=bool)
+        info["gello_mode"] = mode
+        info["gello_align_error"] = self._align_error.copy()
+        info["gello_align_ready"] = np.array([self._align_ready], dtype=bool)
+        info["gello_align_strategy"] = self._align_strategy
         if replaced:
             info["intervene_action"] = effective
         return obs, rew, done, truncated, info
@@ -379,6 +554,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         t = self._stream_thread
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
+        self._release_actuators()
         self.left_expert.close()
         self.right_expert.close()
         return super().close()
