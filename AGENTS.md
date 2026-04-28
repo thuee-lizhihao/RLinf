@@ -2,6 +2,8 @@
 
 Brief for AI coding agents working on RLinf. For full contribution flow, code style, and PR process see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+Default code-change and Git-management principles are summarized in [DEVELOPMENT_PRINCIPLES.zh-CN.md](DEVELOPMENT_PRINCIPLES.zh-CN.md). Treat them as the baseline for future edits in this project.
+
 **Quick orientation:** RLinf is a distributed RL stack (embodied + reasoning + agent). It uses **Ray** for process management and **Hydra** for config. Single-machine runs use `cluster.num_nodes: 1`; multi-node needs Ray started on every node with `RLINF_NODE_RANK` set *before* `ray start`. Pre-commit runs Ruff (lint + format) and commit-check; use Google-style docstrings and type hints. All user-facing changes need tests and docs. If something is unclear, add a `TODO(agent)` and note the limitation.
 
 ---
