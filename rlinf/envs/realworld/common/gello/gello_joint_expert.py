@@ -23,8 +23,16 @@ positions map 1:1 to the robot's joint positions.
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+from rlinf.envs.realworld.common.gello.gello_joint_mapper import GelloJointMapper
+
+if TYPE_CHECKING:
+    from rlinf.envs.realworld.common.gello.gello_dynamixel_bus import (
+        GelloDynamixelBus,
+    )
 
 # Mid-point of each Franka Panda joint range — used as the seed for angle
 # unwrapping so that the first Dynamixel reading lands inside the valid range
@@ -47,15 +55,39 @@ class GelloJointExpert:
     with the previous one (no single-step jump > π).
 
     Args:
-        port: Serial port of the GELLO device.
+        port: Serial port of the GELLO device. Keeps the legacy
+            ``GelloTeleopAgent`` reader path.
+        bus: Shared low-level Dynamixel bus. When provided, the expert reads
+            raw motor positions from this bus instead of opening ``port``.
+        mapper: Mapper used to convert raw bus readings to joint positions.
     """
 
-    def __init__(self, port: str):
-        from gello_teleop.gello_teleop_agent import GelloTeleopAgent
+    def __init__(
+        self,
+        port: str | None = None,
+        bus: "GelloDynamixelBus | None" = None,
+        mapper: GelloJointMapper | None = None,
+    ) -> None:
+        if port is None and bus is None:
+            raise ValueError("either port or bus must be provided")
+        if port is not None and bus is not None:
+            raise ValueError("provide either port or bus, not both")
 
-        self.agent = GelloTeleopAgent(port=port)
+        self.bus = bus
+        self.mapper = mapper or GelloJointMapper()
+        if self.mapper.num_joints != 7:
+            raise ValueError(
+                "GelloJointExpert expects a 7-joint mapper, got "
+                f"{self.mapper.num_joints}"
+            )
+        self.agent = None
+        if self.bus is None:
+            from gello_teleop.gello_teleop_agent import GelloTeleopAgent
+
+            self.agent = GelloTeleopAgent(port=port)
 
         self.state_lock = threading.Lock()
+        self._running = True
         self._ready = False
         self._prev_joints: np.ndarray | None = None
         self.latest_data = {
@@ -65,24 +97,46 @@ class GelloJointExpert:
         self.thread = threading.Thread(target=self._read_gello, daemon=True)
         self.thread.start()
 
+    def _read_action_once(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read one GELLO frame from either the legacy agent or shared bus."""
+        if self.bus is not None:
+            raw = self.bus.read_joints()
+            if raw.shape[0] < self.mapper.num_joints:
+                raise ValueError(
+                    "GELLO bus returned fewer joints than mapper expects: "
+                    f"{raw.shape[0]} < {self.mapper.num_joints}"
+                )
+            joints = self.mapper.raw_to_joint(raw[: self.mapper.num_joints])
+            gripper = (
+                raw[self.mapper.num_joints]
+                if raw.shape[0] > self.mapper.num_joints
+                else 0.0
+            )
+            return joints, np.array([gripper], dtype=np.float64)
+
+        if self.agent is None:
+            raise RuntimeError("GELLO agent is not initialized")
+        gello_joints, gello_gripper = self.agent.get_action()
+        return np.asarray(gello_joints, dtype=np.float64), np.array(
+            [gello_gripper],
+            dtype=np.float64,
+        )
+
     def _read_gello(self):
         import time
 
         consecutive_errors = 0
         max_consecutive_errors = 50
 
-        while True:
+        while self._running:
             try:
-                gello_joints, gello_gripper = self.agent.get_action()
-                gello_gripper = np.array([gello_gripper])
-
-                joints = np.array(gello_joints)
+                joints, gello_gripper = self._read_action_once()
                 ref = (
                     self._prev_joints
                     if self._prev_joints is not None
                     else _FRANKA_RANGE_CENTER
                 )
-                joints = ref + (joints - ref + np.pi) % (2.0 * np.pi) - np.pi
+                joints = self.mapper.unwrap(joints, ref)
                 self._prev_joints = joints
 
                 with self.state_lock:
@@ -104,7 +158,8 @@ class GelloJointExpert:
     @property
     def ready(self) -> bool:
         """Whether at least one GELLO frame has been received."""
-        return self._ready
+        with self.state_lock:
+            return self._ready
 
     def get_action(self) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(joint_positions, gripper)`` from the latest GELLO reading.
@@ -117,6 +172,12 @@ class GelloJointExpert:
                 self.latest_data["joint_positions"].copy(),
                 self.latest_data["gripper"].copy(),
             )
+
+    def close(self) -> None:
+        """Stop the background reader thread."""
+        self._running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":
