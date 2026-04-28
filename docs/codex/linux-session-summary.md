@@ -123,7 +123,8 @@ Run these hardware smoke checks without actuator motion:
    )
 
    bus = GelloDynamixelBus(port="/dev/serial/by-id/<gello-port>")
-   mapper = GelloJointMapper()
+   # Replace signs/offsets with calibration output from gello_calibrate.py.
+   mapper = GelloJointMapper(signs=[...], offsets=[...])
    expert = GelloJointExpert(bus=bus, mapper=mapper)
    # Wait until expert.ready, then inspect expert.get_action().
    expert.close()
@@ -134,6 +135,19 @@ Run these hardware smoke checks without actuator motion:
 4. Slowly move the leader and confirm the seven joint readings are continuous,
    with no obvious `2π` jumps.
 5. Confirm `expert.close()` lets the process exit cleanly.
+
+Important calibration note:
+
+- `GelloJointMapper()` defaults to identity signs and zero offsets. This is only
+  suitable for mock tests.
+- Real shared-bus reader and actuator checks must use calibrated
+  `joint_signs` and `joint_offsets` from
+  `toolkits/realworld_check/gello_calibrate.py`.
+- The dual-Franka GELLO YAML now exposes explicit placeholders:
+  - `left_gello_joint_signs`
+  - `left_gello_joint_offsets`
+  - `right_gello_joint_signs`
+  - `right_gello_joint_offsets`
 
 ## Next Work After Commit 1
 
@@ -154,7 +168,6 @@ Local commits completed after commit 1:
 - `feat(gello): add shared-bus leader actuator`
   - Adds `GelloJointActuator`.
   - Adds current-mode `factr_pd` alignment.
-  - Adds position-control fallback.
   - Adds release-on-timeout and release-on-error behavior.
   - Adds mock actuator unit tests.
 - `feat(gello): gate teleop with leader alignment`
@@ -169,6 +182,8 @@ Local commits completed after commit 1:
     - `y`: confirm teleop after aligned.
     - `p`: cancel/back to policy.
   - Updates the dual-Franka GELLO collection YAML to start in `policy`.
+  - Adds explicit YAML placeholders for left/right GELLO joint signs and
+    offsets.
   - Wires shared bus, mapper, reader, actuator, and keyboard wrapper when
     `gello_align_on_intervention: true`.
 
@@ -183,7 +198,9 @@ Heavy validation still belongs on the shared lab machine:
 1. Run the unit tests added for commits 1-4.
 2. Run `ruff check` and `ruff format --check` on changed files.
 3. Repeat commit 1 GELLO reader smoke tests.
-4. Test commit 2 actuator alone with Franka disconnected.
-5. Test commit 3/4 with fake or disabled actuator before allowing real motion.
-6. Test the final hardware sequence:
+4. Fill `left/right_gello_joint_signs` and `left/right_gello_joint_offsets`
+   from calibration before any shared-bus real hardware check.
+5. Test commit 2 actuator alone with Franka disconnected.
+6. Test commit 3/4 with fake or disabled actuator before allowing real motion.
+7. Test the final hardware sequence:
    `policy -> t -> aligning -> aligned -> y -> teleop -> p -> policy`.

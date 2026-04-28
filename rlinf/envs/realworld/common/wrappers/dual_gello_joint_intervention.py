@@ -88,7 +88,6 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         right_expert: GelloJointExpert | None = None,
         left_actuator: GelloJointActuator | None = None,
         right_actuator: GelloJointActuator | None = None,
-        align_strategy: str = "factr_pd",
         align_tolerance: float = 0.06,
         align_timeout: float = 5.0,
         align_dwell_steps: int = 5,
@@ -123,12 +122,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._stream_paused = threading.Event()
         self._stream_paused.set()  # starts unpaused
 
-        if align_strategy not in ("factr_pd", "position"):
-            raise ValueError(
-                "align_strategy must be one of ('factr_pd', 'position'), got "
-                f"{align_strategy!r}"
-            )
-        self._align_strategy = align_strategy
+        self._align_strategy = "factr_pd"
         self._align_tolerance = align_tolerance
         self._align_timeout = align_timeout
         self._align_dwell_steps = align_dwell_steps
@@ -262,13 +256,6 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         actuator: GelloJointActuator,
         target: np.ndarray,
     ) -> GelloJointActuatorResult:
-        if self._align_strategy == "position":
-            return actuator.move_to_joints_position(
-                target,
-                tolerance=self._align_tolerance,
-                timeout=self._align_timeout,
-                dwell_steps=self._align_dwell_steps,
-            )
         return actuator.move_to_joints_factr_pd(
             target,
             tolerance=self._align_tolerance,

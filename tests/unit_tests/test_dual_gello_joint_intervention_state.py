@@ -86,15 +86,6 @@ class _FakeActuator:
             elapsed=0.0,
         )
 
-    def move_to_joints_position(self, target_q, **kwargs) -> GelloJointActuatorResult:
-        self.targets.append(np.asarray(target_q, dtype=np.float64).copy())
-        return GelloJointActuatorResult(
-            success=True,
-            strategy="position",
-            error=np.zeros(7, dtype=np.float64),
-            elapsed=0.0,
-        )
-
     def emergency_release(self) -> None:
         self.released = True
 

@@ -252,7 +252,6 @@ def apply_dual_arm_franky_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.
             right_expert=right_expert,
             left_actuator=left_actuator,
             right_actuator=right_actuator,
-            align_strategy=cfg.get("gello_align_strategy", "factr_pd"),
             align_tolerance=cfg.get("gello_align_tolerance", 0.06),
             align_timeout=cfg.get("gello_align_timeout", 5.0),
             align_dwell_steps=cfg.get("gello_align_dwell_steps", 5),

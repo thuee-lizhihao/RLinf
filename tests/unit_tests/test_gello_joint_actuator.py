@@ -29,7 +29,6 @@ class _FakeActuatorDriver:
         self.torque_enabled = False
         self.mode: int | None = None
         self.currents: list[np.ndarray] = []
-        self.joint_targets: list[np.ndarray] = []
         self.fail_on_current = False
 
     def get_joints(self) -> np.ndarray:
@@ -43,10 +42,6 @@ class _FakeActuatorDriver:
             raise RuntimeError("current write failed")
         self.currents.append(currents.copy())
         self.positions = self.positions + 0.5 * currents / 100.0
-
-    def set_joints(self, joints: np.ndarray) -> None:
-        self.joint_targets.append(joints.copy())
-        self.positions = joints.copy()
 
     def set_torque_mode(self, enabled: bool) -> None:
         self.torque_enabled = enabled
@@ -122,23 +117,3 @@ def test_factr_pd_error_releases_torque() -> None:
         )
 
     assert not driver.torque_enabled
-
-
-def test_position_success_writes_raw_target_and_releases() -> None:
-    """Position fallback writes mapped raw joints and releases torque."""
-    driver = _FakeActuatorDriver()
-    actuator = GelloJointActuator(GelloDynamixelBus(driver=driver))
-    target = np.linspace(-0.2, 0.2, 7)
-
-    result = actuator.move_to_joints_position(
-        target,
-        tolerance=0.001,
-        timeout=1.0,
-        dwell_steps=1,
-        period=0.0,
-    )
-
-    assert result.success
-    np.testing.assert_allclose(driver.joint_targets[0], target)
-    assert not driver.torque_enabled
-    assert driver.mode == 3

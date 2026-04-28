@@ -28,7 +28,6 @@ from rlinf.envs.realworld.common.gello.gello_dynamixel_bus import (
 from rlinf.envs.realworld.common.gello.gello_joint_mapper import GelloJointMapper
 
 CURRENT_CONTROL_MODE = 0
-POSITION_CONTROL_MODE = 3
 
 
 @dataclass(frozen=True)
@@ -159,57 +158,6 @@ class GelloJointActuator:
                 raw_current = self.mapper.signs * joint_current
                 raw_current = np.clip(raw_current, -limit, limit)
                 self.bus.write_currents(raw_current)
-                time.sleep(period)
-        except Exception:
-            self.emergency_release()
-            raise
-
-    def move_to_joints_position(
-        self,
-        target_q: Sequence[float] | np.ndarray,
-        *,
-        tolerance: float = 0.06,
-        timeout: float = 5.0,
-        dwell_steps: int = 5,
-        period: float = 0.01,
-        release_on_success: bool = True,
-    ) -> GelloJointActuatorResult:
-        """Move the GELLO leader to ``target_q`` with position control."""
-        target = self._as_joint_vector(target_q, "target_q")
-        raw_target = self.mapper.joint_to_raw(target)
-        start = time.monotonic()
-        dwell = 0
-        last_error = np.full(self.mapper.num_joints, np.inf, dtype=np.float64)
-
-        try:
-            self._set_control_mode(POSITION_CONTROL_MODE)
-            self.bus.write_joints(raw_target)
-            while True:
-                q = self.read_joints()
-                last_error = target - q
-                if float(np.max(np.abs(last_error))) <= tolerance:
-                    dwell += 1
-                    if dwell >= dwell_steps:
-                        if release_on_success:
-                            self.disable_torque()
-                        return GelloJointActuatorResult(
-                            success=True,
-                            strategy="position",
-                            error=last_error,
-                            elapsed=time.monotonic() - start,
-                        )
-                else:
-                    dwell = 0
-
-                if time.monotonic() - start >= timeout:
-                    self.disable_torque()
-                    return GelloJointActuatorResult(
-                        success=False,
-                        strategy="position",
-                        error=last_error,
-                        elapsed=time.monotonic() - start,
-                        message="timeout",
-                    )
                 time.sleep(period)
         except Exception:
             self.emergency_release()

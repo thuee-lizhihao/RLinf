@@ -83,9 +83,14 @@ env:
     # Override here only if you swap GELLO units for a session.
     left_gello_port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAJEDPC-if00-port0"
     right_gello_port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAM5DHY-if00-port0"
+    # Fill these with the output from toolkits/realworld_check/gello_calibrate.py
+    # before enabling shared-bus reader or actuator alignment on real hardware.
+    left_gello_joint_signs: []
+    left_gello_joint_offsets: []
+    right_gello_joint_signs: []
+    right_gello_joint_offsets: []
     gello_default_mode: "policy"
     gello_align_on_intervention: true
-    gello_align_strategy: "factr_pd"
     gello_align_tolerance: 0.06
     gello_align_timeout: 5.0
     gello_align_dwell_steps: 5
