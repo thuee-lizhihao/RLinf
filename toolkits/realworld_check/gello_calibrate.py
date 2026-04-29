@@ -77,6 +77,9 @@ GELLO_PORT = os.environ.get(
     "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAJEDPC-if00-port0",
 )
 DXL_BAUDRATE = int(os.environ.get("GELLO_BAUDRATE", "1000000"))
+DXL_MAX_RETRIES = int(os.environ.get("GELLO_COMM_MAX_RETRIES", "10"))
+DXL_RETRY_SLEEP_S = float(os.environ.get("GELLO_COMM_RETRY_SLEEP_S", "0.02"))
+DXL_MAX_CONSECUTIVE_ERRORS = int(os.environ.get("GELLO_COMM_MAX_CONSEC_ERRORS", "50"))
 
 # Two reachable robot poses for sign + offset calibration.
 #
@@ -109,6 +112,31 @@ GRIPPER_ID = 8  # gripper Dynamixel id (per existing config)
 NUM_ARM = len(JOINT_IDS)
 TWO_PI = 2.0 * math.pi
 # ────────────────────────────────────────────────────────────────────────
+
+
+def read_gello_joints_with_retry(driver: DynamixelDriver) -> list[float]:
+    """Read one Dynamixel frame with retry/backoff and actionable error."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, DXL_MAX_RETRIES) + 1):
+        try:
+            return driver.get_joints()
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(DXL_RETRY_SLEEP_S * attempt)
+            continue
+    raise RuntimeError(
+        "Failed to read from GELLO Dynamixel chain after retries.\n"
+        f"  port={GELLO_PORT}\n"
+        f"  baudrate={DXL_BAUDRATE}\n"
+        "\n"
+        "Troubleshooting checklist (most common first):\n"
+        "  - Ensure no other process is using the same serial port.\n"
+        "  - Ensure you have read/write permission on the port (chmod/dialout).\n"
+        "  - Power-cycle the GELLO chain and replug the USB-serial adapter.\n"
+        "  - Check RS-485/TTL cabling and that all Dynamixel IDs respond.\n"
+        "  - Confirm the baudrate matches the Dynamixel configuration.\n"
+        f"\nLast exception: {last_exc!r}"
+    ) from last_exc
 
 
 def colour(text: str, code: str) -> str:
@@ -155,7 +183,7 @@ def setup_gello_raw() -> DynamixelDriver:
     )
     # Warm up — first few reads may be noisy.
     for _ in range(10):
-        driver.get_joints()
+        read_gello_joints_with_retry(driver)
         time.sleep(0.01)
     print("GELLO ready.", flush=True)
     return driver
@@ -165,7 +193,7 @@ def read_raw_arm(driver: DynamixelDriver, n_samples: int = 30) -> np.ndarray:
     """Average several raw motor reads on the 7 arm joints."""
     samples = []
     for _ in range(n_samples):
-        q = driver.get_joints()
+        q = read_gello_joints_with_retry(driver)
         samples.append(np.asarray(q[:NUM_ARM], dtype=np.float64))
         time.sleep(0.01)
     return np.median(np.stack(samples, axis=0), axis=0)
@@ -174,7 +202,7 @@ def read_raw_arm(driver: DynamixelDriver, n_samples: int = 30) -> np.ndarray:
 def read_raw_gripper(driver: DynamixelDriver, n_samples: int = 30) -> float:
     samples = []
     for _ in range(n_samples):
-        q = driver.get_joints()
+        q = read_gello_joints_with_retry(driver)
         samples.append(float(q[NUM_ARM]))
         time.sleep(0.01)
     return float(np.median(np.asarray(samples)))
@@ -266,6 +294,7 @@ def wait_for_enter(prompt: str, driver: DynamixelDriver | None = None) -> None:
         import select
 
         last_print = 0.0
+        consecutive_errors = 0
         while True:
             r, _, _ = select.select([sys.stdin], [], [], 0.05)
             if r:
@@ -273,14 +302,23 @@ def wait_for_enter(prompt: str, driver: DynamixelDriver | None = None) -> None:
                 return
             now = time.time()
             if now - last_print > 0.2:
-                q = driver.get_joints()
-                arm = np.asarray(q[:NUM_ARM], dtype=np.float64)
-                line = "  raw motors: " + " ".join(
-                    f"J{i + 1}={arm[i]:+.3f}" for i in range(NUM_ARM)
-                )
-                sys.stdout.write("\r\033[2K" + line)
-                sys.stdout.flush()
-                last_print = now
+                try:
+                    q = read_gello_joints_with_retry(driver)
+                    consecutive_errors = 0
+                    arm = np.asarray(q[:NUM_ARM], dtype=np.float64)
+                    line = "  raw motors: " + " ".join(
+                        f"J{i + 1}={arm[i]:+.3f}" for i in range(NUM_ARM)
+                    )
+                    sys.stdout.write("\r\033[2K" + line)
+                    sys.stdout.flush()
+                    last_print = now
+                except Exception:
+                    consecutive_errors += 1
+                    if consecutive_errors >= DXL_MAX_CONSECUTIVE_ERRORS:
+                        raise
+                    time.sleep(
+                        min(0.1, DXL_RETRY_SLEEP_S * (2**min(consecutive_errors, 7)))
+                    )
     except KeyboardInterrupt:
         print()
         print("aborted by user; no calibration was written.", file=sys.stderr)
@@ -491,7 +529,6 @@ def main() -> None:
         f"        joint_signs=({sign_tuple}),\n"
         f"        gripper_config=({GRIPPER_ID}, "
         f"{int(round(grip_open_deg))}, {int(round(grip_close_deg))}),\n"
-        f"        baudrate=1_000_000,\n"
         f"    ),"
     )
     print()
