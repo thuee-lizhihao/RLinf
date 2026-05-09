@@ -23,9 +23,9 @@ from rlinf.envs.realworld.common.gello import GelloDynamixelBus, GelloJointActua
 class _FakeActuatorDriver:
     """Fake Dynamixel driver for actuator safety tests."""
 
-    def __init__(self) -> None:
-        self.positions = np.zeros(7, dtype=np.float64)
-        self.velocities = np.zeros(7, dtype=np.float64)
+    def __init__(self, num_servos: int = 7) -> None:
+        self.positions = np.zeros(num_servos, dtype=np.float64)
+        self.velocities = np.zeros(num_servos, dtype=np.float64)
         self.torque_enabled = False
         self.mode: int | None = None
         self.currents: list[np.ndarray] = []
@@ -41,7 +41,7 @@ class _FakeActuatorDriver:
         if self.fail_on_current:
             raise RuntimeError("current write failed")
         self.currents.append(currents.copy())
-        self.positions = self.positions + 0.5 * currents / 100.0
+        self.positions[:7] = self.positions[:7] + 0.5 * currents[:7] / 100.0
 
     def set_torque_mode(self, enabled: bool) -> None:
         self.torque_enabled = enabled
@@ -117,3 +117,27 @@ def test_factr_pd_error_releases_torque() -> None:
         )
 
     assert not driver.torque_enabled
+
+
+def test_factr_pd_pads_current_for_extra_servo() -> None:
+    """Current-mode PD pads non-arm servos with zero current."""
+    driver = _FakeActuatorDriver(num_servos=8)
+    actuator = GelloJointActuator(
+        GelloDynamixelBus(driver=driver),
+        kp=np.full(7, 200.0),
+        kd=np.zeros(7),
+        current_limit=np.full(7, 100.0),
+    )
+
+    result = actuator.move_to_joints_factr_pd(
+        np.full(7, 0.2),
+        tolerance=0.03,
+        timeout=1.0,
+        dwell_steps=1,
+        period=0.0,
+    )
+
+    assert result.success
+    assert driver.currents
+    assert driver.currents[0].shape == (8,)
+    assert driver.currents[0][7] == 0.0

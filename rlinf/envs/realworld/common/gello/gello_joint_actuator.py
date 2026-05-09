@@ -128,7 +128,7 @@ class GelloJointActuator:
         try:
             self._set_control_mode(CURRENT_CONTROL_MODE)
             while True:
-                q, qd = self._read_joint_positions_and_velocities()
+                q, qd, raw_dim = self._read_joint_positions_and_velocities()
                 last_error = target - q
                 if float(np.max(np.abs(last_error))) <= tolerance:
                     dwell += 1
@@ -157,6 +157,7 @@ class GelloJointActuator:
                 joint_current = p_gain * last_error - d_gain * qd
                 raw_current = self.mapper.signs * joint_current
                 raw_current = np.clip(raw_current, -limit, limit)
+                raw_current = self._pad_raw_command(raw_current, raw_dim)
                 self.bus.write_currents(raw_current)
                 time.sleep(period)
         except Exception:
@@ -181,11 +182,35 @@ class GelloJointActuator:
         self.bus.verify_operating_mode(mode)
         self.enable_torque()
 
-    def _read_joint_positions_and_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+    def _read_joint_positions_and_velocities(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         raw_q, raw_qd = self.bus.read_positions_and_velocities()
+        if raw_q.shape[0] < self.mapper.num_joints:
+            raise ValueError(
+                "raw joint position length must be at least "
+                f"{self.mapper.num_joints}, got {raw_q.shape[0]}"
+            )
+        if raw_qd.shape[0] < self.mapper.num_joints:
+            raise ValueError(
+                "raw joint velocity length must be at least "
+                f"{self.mapper.num_joints}, got {raw_qd.shape[0]}"
+            )
         q = self.mapper.raw_to_joint(raw_q[: self.mapper.num_joints])
         qd = self.mapper.signs * raw_qd[: self.mapper.num_joints]
-        return q, qd
+        return q, qd, raw_q.shape[0]
+
+    def _pad_raw_command(self, values: np.ndarray, raw_dim: int) -> np.ndarray:
+        if raw_dim == self.mapper.num_joints:
+            return values
+        if raw_dim < self.mapper.num_joints:
+            raise ValueError(
+                "raw command length must be at least "
+                f"{self.mapper.num_joints}, got {raw_dim}"
+            )
+        padded = np.zeros(raw_dim, dtype=np.float64)
+        padded[: self.mapper.num_joints] = values
+        return padded
 
     def _as_joint_vector(
         self,
