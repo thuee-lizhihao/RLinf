@@ -17,15 +17,8 @@ from .dosw1 import tasks as dosw1_tasks
 from .franka import FrankaEnv, FrankaRobotConfig, FrankaRobotState
 from .franka import tasks as franka_tasks
 from .franka.dual_franka_env import DualFrankaEnv, DualFrankaRobotConfig
-from .franka.dual_franka_franky_env import DualFrankaFrankyEnv
-from .franka.dual_franka_joint_env import (
-    DualFrankaJointEnv,
-    DualFrankaJointRobotConfig,
-)
-from .franka.dual_franka_rot6d_env import (
-    DualFrankaRot6dEnv,
-    DualFrankaRot6dRobotConfig,
-)
+from .gim_arm import GimArmEnv, GimArmRobotConfig, GimArmRobotState
+from .gim_arm import tasks as gim_arm_tasks
 from .realworld_env import RealWorldEnv
 from .xsquare import Turtle2Env, Turtle2RobotConfig, Turtle2RobotState
 from .xsquare import tasks as xsquare_tasks
@@ -47,6 +40,10 @@ __all__ = [
     "FrankaRobotConfig",
     "FrankaRobotState",
     "franka_tasks",
+    "GimArmEnv",
+    "GimArmRobotConfig",
+    "GimArmRobotState",
+    "gim_arm_tasks",
     "Turtle2Env",
     "Turtle2RobotConfig",
     "Turtle2RobotState",
