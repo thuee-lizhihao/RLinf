@@ -29,6 +29,8 @@ RLinf 是一个灵活且可扩展的开源框架，专为具身智能和智能�
 </div>
 
 ## 最新动态
+- [2026/05] 🔥 RLinf 支持 GimArm. 文档: [GimArm](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/gim_arm.html)
+- [2026/04] 🔥 RLinf 支持 DM0。特别地，RLinf 与 Dexbotic 实现乐高式 SFT-RL，链接：[Dexbotic项目链接](https://github.com/dexmal/dexbotic/blob/main/docs/RLinfAsRLBackend.md)
 - [2026/04] 🔥 RLinf 支持 Dexmal DOS-W1 用于真机强化学习。文档：[Dexmal DOS-W1 真机强化学习](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/dosw1.html)。
 - [2026/04] 🔥 RLinf 支持 RECAP（RL with Experience and Corrections via Advantage-conditioned Policies）离线优势条件策略优化。文档：[RECAP](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/recap.html)。
 - [2026/04] 🔥 RLinf 现已支持基于D4RL基准的离线 IQL 训练。文档：[D4RL 上的 IQL](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/iql_d4rl.html)，论文：[Offline Reinforcement Learning with Implicit Q-Learning](https://arxiv.org/abs/2110.06169)。
@@ -205,6 +207,7 @@ RLinf具有高度灵活性，可支持多种强化学习训练工作流（PPO、
           <li><a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/xsquare_turtle2.html">XSquare Turtle2</a> ✅</li>
           <li><a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/tutorials/components/data_collection.html">Dual-franka</a> ✅</li>
           <li><a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/dosw1.html">DOS-W1</a> ✅</li>
+          <li><a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/gim_arm.html">GimArm</a> ✅</li>
           <li>More...</li>
         </ul>
       </td>
@@ -220,6 +223,11 @@ RLinf具有高度灵活性，可支持多种强化学习训练工作流（PPO、
               SpaceMouse
             </a> ✅
           </li>
+          <li>
+            <a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/gim_arm.html">
+              PICO VR
+            </a> ✅
+          </li>          
         </ul>
       </td>
     </tr>
@@ -289,11 +297,12 @@ RLinf具有高度灵活性，可支持多种强化学习训练工作流（PPO、
 - [Dexbotic](https://github.com/dexmal/dexbotic): 融合机器人与强化学习的系统，通过RLinf支持具身智能体的可扩展训练与部署。
 - [RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin): 数字孪生与机器人结合的平台，利用RLinf进行大规模具身强化学习训练。
 - [IsaacLab](https://github.com/isaac-sim/IsaacLab/tree/develop/scripts/reinforcement_learning/rlinf): 将RLinf正式整合进IsaacLab，可在基于NVIDIA Isaac Sim的机器人环境中实现无缝衔接的强化学习工作流程。
+- [RISE](https://github.com/OpenDriveLab/RISE): 基于组合式世界模型的机器人强化学习框架，使用 RLinf 进行在线强化学习。
 
 💡 希望在此展示您的项目吗？欢迎提交拉取请求（PR），我们非常乐意将其收录其中！
 
 ## 采用方（Adoption）
-RLinf 是一款面向具身智能、可用于生产环境的开源强化学习框架。RLinf 正在被多家企业与创业团队用于具身智能与强化学习相关的研发与落地，包括 智元机器人、自变量机器人、灵初智能、原力灵机、摩尔线程、地瓜机器人与跨维智能等。
+RLinf 是一款面向具身智能、可用于生产环境的开源强化学习框架。RLinf 正在被多家企业与创业团队用于具身智能与强化学习相关的研发与落地，包括 智元机器人、自变量机器人、灵初智能、原力灵机、摩尔线程、地瓜机器人、跨维智能、华为引望、蚂蚁灵波和极佳视界等。
 
 <div align="center">
   <img src="https://github.com/RLinf/misc/raw/main/pic/adoption_logos/adoption.png" alt="adoption"/>

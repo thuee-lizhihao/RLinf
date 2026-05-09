@@ -20,6 +20,4 @@ uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
-/datasets
-/models
-/checkpoints
+.claude/settings.json
