@@ -91,16 +91,11 @@ Implement:
   - `disable_torque()`
   - `read_joints()`
   - `move_to_joints_factr_pd(target_q, ...)`
-  - `move_to_joints_position(target_q, ...)`
   - `emergency_release()`
 
-Preferred strategy:
+Alignment strategy:
 
 - `factr_pd`
-
-Fallback:
-
-- `position`
 
 Safety:
 
@@ -191,7 +186,6 @@ Implement:
 ```yaml
 gello_default_mode: "policy"
 gello_align_on_intervention: true
-gello_align_strategy: "factr_pd"
 gello_align_tolerance: 0.06
 gello_align_timeout: 5.0
 gello_align_dwell_steps: 5

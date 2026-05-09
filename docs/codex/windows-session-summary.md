@@ -90,8 +90,7 @@ q_gello = sign * (q_raw - offset)
 q_raw_target = sign * q_robot_target + offset
 ```
 
-Position control is only a fallback strategy. Preferred strategy name:
-`factr_pd`; fallback strategy: `position`.
+Use `factr_pd` as the only leader alignment strategy.
 
 Do not migrate FACTR gravity compensation, null-space torque, bilateral force
 feedback, or follower external torque feedback in the first implementation.
