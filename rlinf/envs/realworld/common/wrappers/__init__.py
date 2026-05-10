@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .apply import (
-    apply_dual_arm_franky_wrappers,
-    apply_dual_arm_wrappers,
-    apply_single_arm_wrappers,
-)
+"""Wrappers for real-world environments."""
+
+from typing import TYPE_CHECKING
+
+from .apply import apply_dual_arm_franky_wrappers, apply_dual_arm_wrappers, apply_single_arm_wrappers
 from .dual_euler_obs import DualQuat2EulerWrapper
 from .dual_gello_intervention import DualGelloIntervention
 from .dual_gello_joint_intervention import DualGelloJointIntervention
@@ -35,6 +35,9 @@ from .reward_done_wrapper import (
 )
 from .spacemouse_intervention import SpacemouseIntervention
 
+if TYPE_CHECKING:
+    from .dexhand_intervention import DexHandIntervention
+
 __all__ = [
     "DualGelloIntervention",
     "DualGelloJointIntervention",
@@ -46,6 +49,7 @@ __all__ = [
     "GelloAlignmentKeyboardWrapper",
     "GripperCloseEnv",
     "KeyboardRewardDoneMultiStageWrapper",
+    "DexHandIntervention",
     "KeyboardRewardDoneWrapper",
     "KeyboardStartEndWrapper",
     "LeaderFollowerKeyboardIntervention",
@@ -56,3 +60,22 @@ __all__ = [
     "apply_dual_arm_wrappers",
     "apply_single_arm_wrappers",
 ]
+
+
+def __getattr__(name: str):
+    if name != "DexHandIntervention":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    try:
+        from .dexhand_intervention import DexHandIntervention
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.split(".")[0] == "rlinf_dexhand":
+            raise ModuleNotFoundError(
+                "DexHandIntervention requires optional dependency "
+                "'rlinf_dexhand'. Install it before enabling "
+                "dexterous-hand teleoperation."
+            ) from exc
+        raise
+
+    globals()[name] = DexHandIntervention
+    return DexHandIntervention
